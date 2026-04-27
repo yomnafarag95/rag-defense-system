@@ -1,0 +1,9 @@
+﻿venv/
+models/
+data/
+logs/
+__pycache__/
+*.pkl
+*.zip
+*.pyc
+.env
