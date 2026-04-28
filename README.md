@@ -10,4 +10,4 @@ pinned: false
 ---
 
 # RAG Defense System
-Three-layer prompt injection defense pipeline for RAG systems.
+Three-layer defense against prompt injections.
