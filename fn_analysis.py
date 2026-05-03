@@ -1,210 +1,185 @@
 import json
 import os
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
-from sklearn.metrics import roc_curve, precision_recall_curve, auc
 from collections import Counter
 
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.dpi': 300,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'savefig.pad_inches': 0.05,
-})
-
 RESULTS_FILE = "logs/eval_results.jsonl"
-OUT_DIR = "figures"
-os.makedirs(OUT_DIR, exist_ok=True)
+
+def classify_family(text, attack_type="unknown"):
+    """
+    Classify into Table II categories (IEEE paper).
+    Uses attack_type from data first, falls back to keyword matching.
+    """
+    # Map data loader types to Table II categories
+    type_map = {
+        "indirect_injection": "Indirect Document Injection",
+        "encoding_obfuscation": "Base64 / Encoding Evasion",
+        "payload_splitting": "Multi-turn Context Poisoning",
+        "role_manipulation": "Role Manipulation",
+        "context_exhaustion": "Multi-turn Context Poisoning",
+        "instruction_override": "Instruction Override (direct)",
+    }
+    
+    if attack_type in type_map:
+        return type_map[attack_type]
+    
+    # Keyword fallback for unlabelled data
+    t = text.lower()
+    
+    if any(k in t for k in ["ignore previous", "ignore all", "disregard", 
+                             "forget your", "override", "do not follow",
+                             "ignore your", "ignore the above"]):
+        return "Instruction Override (direct)"
+    
+    elif any(k in t for k in ["dan", "jailbreak", "you are now", "roleplay", 
+                               "act as", "pretend", "you are a",
+                               "no restrictions", "unrestricted"]):
+        return "Role Manipulation"
+    
+    elif any(k in t for k in ["base64", "encode", "decode", "aWdub3Jl",
+                               "rot13", "hex"]):
+        return "Base64 / Encoding Evasion"
+    
+    elif any(ord(c) > 127 for c in t[:100]):
+        return "Cross-Language (German, Unicode)"
+    
+    elif any(k in t for k in ["document:", "context:", "retrieved", 
+                               "passage:", "the following text",
+                               "instead of", "before responding"]):
+        return "Indirect Document Injection"
+    
+    elif any(k in t for k in ["step 1", "first do", "then do", 
+                               "multi-turn", "continuation",
+                               "keep saying", "repeat"]):
+        return "Multi-turn Context Poisoning"
+    
+    else:
+        return "Semantic Camouflage"
 
 
-def load_data():
+def main():
+    if not os.path.exists(RESULTS_FILE):
+        print(f"ERROR: {RESULTS_FILE} not found!")
+        return
+
     records = []
     with open(RESULTS_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 records.append(json.loads(line))
+
     print(f"Loaded {len(records)} records")
-    return records
 
-
-def make_fig2_roc_pr(records):
-    y_true = np.array([r.get("true_label", 0) for r in records])
-    y_scores = np.array([r.get("risk_score", 0.0) for r in records])
-
-    if len(set(y_true)) < 2:
-        print("WARNING: Only one class. Cannot plot.")
-        return
-
-    fpr, tpr, _ = roc_curve(y_true, y_scores)
-    roc_auc = auc(fpr, tpr)
-    precision, recall, _ = precision_recall_curve(y_true, y_scores)
-    pr_auc = auc(recall, precision)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6.5, 2.8))
-
-    ax1.plot(fpr, tpr, color='#1565C0', linewidth=1.8,
-             label=f'RAG-Shield (AUC = {roc_auc:.3f})')
-    ax1.plot([0, 1], [0, 1], 'k--', linewidth=0.7, alpha=0.4, label='Random Baseline')
-    ax1.fill_between(fpr, tpr, alpha=0.08, color='#1565C0')
-    ax1.set_xlabel('False Positive Rate')
-    ax1.set_ylabel('True Positive Rate')
-    ax1.set_title('ROC Curve')
-    ax1.legend(loc='lower right')
-    ax1.set_xlim([-0.02, 1.02])
-    ax1.set_ylim([-0.02, 1.02])
-    ax1.grid(True, alpha=0.15, linewidth=0.5)
-    ax1.set_aspect('equal')
-
-    ax2.plot(recall, precision, color='#C62828', linewidth=1.8,
-             label=f'RAG-Shield (AUC = {pr_auc:.3f})')
-    baseline = y_true.sum() / len(y_true)
-    ax2.axhline(y=baseline, color='k', linestyle='--', linewidth=0.7,
-                alpha=0.4, label=f'Random ({baseline:.2f})')
-    ax2.fill_between(recall, precision, alpha=0.08, color='#C62828')
-    ax2.set_xlabel('Recall')
-    ax2.set_ylabel('Precision')
-    ax2.set_title('Precision-Recall Curve')
-    ax2.legend(loc='lower left')
-    ax2.set_xlim([-0.02, 1.02])
-    ax2.set_ylim([-0.02, 1.05])
-    ax2.grid(True, alpha=0.15, linewidth=0.5)
-    ax2.set_aspect('equal')
-
-    plt.tight_layout()
-    fig.savefig(os.path.join(OUT_DIR, "fig2_roc_pr.pdf"))
-    fig.savefig(os.path.join(OUT_DIR, "fig2_roc_pr.png"))
-    print(f"Saved: fig2_roc_pr  (ROC AUC={roc_auc:.4f}, PR AUC={pr_auc:.4f})")
-    plt.close()
-
-
-def make_fig3_confusion_attribution(records):
     attacks = [r for r in records if r["true_label"] == 1]
     benign = [r for r in records if r["true_label"] == 0]
 
-    std_attacks = attacks[:200] if len(attacks) >= 200 else attacks
-    eva_attacks = attacks[200:] if len(attacks) > 200 else []
+    print(f"Attacks: {len(attacks)}")
+    print(f"Benign: {len(benign)}")
 
-    std_tp = sum(1 for r in std_attacks if r.get("pred_label", 0) == 1)
-    std_fn = len(std_attacks) - std_tp
-    std_fp = sum(1 for r in benign if r.get("pred_label", 0) == 1)
-    std_tn = len(benign) - std_fp
+    tp_list = []
+    fn_list = []
 
-    eva_tp = sum(1 for r in eva_attacks if r.get("pred_label", 0) == 1)
-    eva_fn = len(eva_attacks) - eva_tp
+    for r in attacks:
+        text = r.get("text", "")
+        score = r.get("risk_score", 0)
+        layer = r.get("blocking_layer", "none")
+        l1 = r.get("l1_score", 0)
+        l2 = r.get("l2_score", 0)
+        l3 = r.get("l3_score", 0)
+        attack_type = r.get("attack_type", "unknown")
+        
+        # Use Table II categories
+        family = classify_family(text, attack_type)
 
-    print(f"  Standard: TP={std_tp}, FN={std_fn}, FP={std_fp}, TN={std_tn}")
-    print(f"  Evasion:  TP={eva_tp}, FN={eva_fn}")
+        entry = {
+            "text": text[:100],
+            "family": family,
+            "score": score,
+            "layer": layer,
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+        }
 
-    std_blocked = [r for r in std_attacks if r.get("pred_label", 0) == 1]
-    std_layers = Counter(r.get("blocking_layer", "Unknown") for r in std_blocked)
-    eva_blocked = [r for r in eva_attacks if r.get("pred_label", 0) == 1]
-    eva_layers = Counter(r.get("blocking_layer", "Unknown") for r in eva_blocked)
+        pred = r.get("pred_label", 0)
+        if pred == 1:
+            tp_list.append(entry)
+        else:
+            fn_list.append(entry)
 
-    print(f"  Standard layers: {dict(std_layers)}")
-    print(f"  Evasion layers:  {dict(eva_layers)}")
+    print(f"\nTrue Positives: {len(tp_list)}")
+    print(f"False Negatives: {len(fn_list)}")
+    print(f"ADR: {len(tp_list)/len(attacks):.4f}" if attacks else "ADR: N/A")
 
-    fig = plt.figure(figsize=(6.5, 5.5))
+    # Table V with Table II categories
+    print("\n" + "=" * 70)
+    print("  TABLE V: Detection Rate by Attack Family (Table II categories)")
+    print("=" * 70)
+    print(f"  {'Attack Family':<35} {'Total':>6} {'TP':>6} {'FN':>6} {'ADR':>8}")
+    print("-" * 70)
 
-    ax1 = fig.add_subplot(2, 2, 1)
-    cm_std = np.array([[std_tp, std_fn], [std_fp, std_tn]])
-    _plot_confusion_color(ax1, cm_std, f"Standard (n={len(std_attacks)})")
+    all_entries = tp_list + fn_list
+    all_families = Counter(e["family"] for e in all_entries)
+    tp_families = Counter(e["family"] for e in tp_list)
+    fn_families = Counter(e["family"] for e in fn_list)
 
-    ax2 = fig.add_subplot(2, 2, 2)
-    cm_eva = np.array([[eva_tp, eva_fn], [0, 0]])
-    _plot_confusion_color(ax2, cm_eva, f"Evasion (n={len(eva_attacks)})")
+    # Sort by Table II order
+    table2_order = [
+        "Instruction Override (direct)",
+        "Role Manipulation",
+        "Indirect Document Injection",
+        "Base64 / Encoding Evasion",
+        "Cross-Language (German, Unicode)",
+        "Semantic Camouflage",
+        "Multi-turn Context Poisoning",
+    ]
 
-    ax3 = fig.add_subplot(2, 2, 3)
-    _plot_attribution_color(ax3, std_layers, std_tp, "Standard Detections")
+    for family in table2_order:
+        if family in all_families:
+            total = all_families[family]
+            tp = tp_families.get(family, 0)
+            fn = fn_families.get(family, 0)
+            adr = tp / total if total > 0 else 0
+            print(f"  {family:<35} {total:>6} {tp:>6} {fn:>6} {adr:>8.3f}")
 
-    ax4 = fig.add_subplot(2, 2, 4)
-    _plot_attribution_color(ax4, eva_layers, eva_tp, "Evasion Detections")
+    # Print any families not in Table II order
+    for family in sorted(all_families.keys()):
+        if family not in table2_order:
+            total = all_families[family]
+            tp = tp_families.get(family, 0)
+            fn = fn_families.get(family, 0)
+            adr = tp / total if total > 0 else 0
+            print(f"  {family:<35} {total:>6} {tp:>6} {fn:>6} {adr:>8.3f}")
 
-    plt.tight_layout(h_pad=1.5, w_pad=1.0)
-    fig.savefig(os.path.join(OUT_DIR, "fig3_confusion_attribution.pdf"))
-    fig.savefig(os.path.join(OUT_DIR, "fig3_confusion_attribution.png"))
-    print(f"Saved: fig3_confusion_attribution")
-    plt.close()
+    print("-" * 70)
+    print(f"  {'TOTAL':<35} {len(attacks):>6} {len(tp_list):>6} {len(fn_list):>6} {len(tp_list)/len(attacks):>8.3f}" if attacks else "")
 
+    # Verification checks
+    print(f"\n  Verification:")
+    print(f"    Sum of n = {sum(all_families.values())} (should be {len(attacks)})")
+    print(f"    Sum of TP = {sum(tp_families.values())} (should be {len(tp_list)})")
+    print(f"    Sum of FN = {sum(fn_families.values())} (should be {len(fn_list)})")
 
-def _plot_confusion_color(ax, cm, title):
-    colors = ['#FFFFFF', '#E3F2FD', '#90CAF9', '#42A5F5', '#1565C0']
-    cmap = LinearSegmentedColormap.from_list('blue_pro', colors)
-    ax.imshow(cm, cmap=cmap, aspect='auto', vmin=0, vmax=max(cm.max(), 1))
-    for i in range(2):
-        for j in range(2):
-            val = cm[i, j]
-            color = 'white' if val > cm.max() * 0.6 else 'black'
-            ax.text(j, i, str(val), ha='center', va='center',
-                    fontsize=14, fontweight='bold', color=color)
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Pred Attack", "Pred Benign"], fontsize=8)
-    ax.set_yticklabels(["Real Attack", "Real Benign"], fontsize=8)
-    ax.set_title(title, fontsize=10, fontweight='bold')
+    if fn_list:
+        scores = [e["score"] for e in fn_list]
+        print(f"\n  FN Risk Score Stats:")
+        print(f"    Mean:  {sum(scores)/len(scores):.4f}")
+        print(f"    Min:   {min(scores):.4f}")
+        print(f"    Max:   {max(scores):.4f}")
+        near = [s for s in scores if s >= 0.30]
+        print(f"    Near-misses (>= 0.30): {len(near)}/{len(scores)}")
 
+        print(f"\n  FN Per-Layer Scores:")
+        print(f"    L1 mean: {sum(e['l1'] for e in fn_list)/len(fn_list):.4f}")
+        print(f"    L2 mean: {sum(e['l2'] for e in fn_list)/len(fn_list):.4f}")
+        print(f"    L3 mean: {sum(e['l3'] for e in fn_list)/len(fn_list):.4f}")
 
-def _plot_attribution_color(ax, layer_counts, total_tp, title):
-    if total_tp == 0:
-        ax.text(0.5, 0.5, "No detections", ha='center', va='center', fontsize=9)
-        ax.set_title(title, fontsize=10, fontweight='bold')
-        return
-
-    name_map = {
-        "Layer 1 - Anomaly Detection": "L1: Anomaly Det.",
-        "Layer 2 - Intent Classifier": "L2: Intent Cls.",
-        "Layer 3 - Behavioral Monitor": "L3: Semantic Mon.",
-        "Meta Aggregator - Combined Risk": "Meta-Agg",
-    }
-    color_map = {
-        "L1: Anomaly Det.": '#1565C0',
-        "L2: Intent Cls.": '#E65100',
-        "L3: Semantic Mon.": '#2E7D32',
-        "Meta-Agg": '#6A1B9A',
-    }
-
-    labels = []
-    sizes = []
-    colors = []
+    print(f"\n  TP Layer Attribution:")
+    layer_counts = Counter(e["layer"] for e in tp_list)
     for layer, count in layer_counts.most_common():
-        short = name_map.get(layer, layer[:15])
-        pct = count / total_tp * 100
-        labels.append(f"{short}\n({pct:.0f}%)")
-        sizes.append(count)
-        colors.append(color_map.get(short, '#757575'))
-
-    ax.pie(sizes, labels=labels, colors=colors, startangle=90,
-           textprops={'fontsize': 7.5},
-           wedgeprops={'edgecolor': 'white', 'linewidth': 1.5})
-    ax.set_title(title, fontsize=10, fontweight='bold')
+        pct = count / len(tp_list) * 100
+        print(f"    {layer}: {count} ({pct:.1f}%)")
 
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  Generating Color Figures")
-    print("=" * 50)
-
-    if not os.path.exists(RESULTS_FILE):
-        print(f"ERROR: {RESULTS_FILE} not found!")
-        exit(1)
-
-    records = load_data()
-
-    print("\n-- Figure 2: ROC + PR --")
-    make_fig2_roc_pr(records)
-
-    print("\n-- Figure 3: Confusion + Attribution --")
-    make_fig3_confusion_attribution(records)
-
-    print("\nDone!")
+    main()

@@ -1,5 +1,8 @@
 """
 generate_paper_figures.py — Color figures for IEEE paper
+FIXED: Counts both BLOCKED and MONITORED as detected (matches eval_suite.py)
+FIXED: Pie chart labels use 1 decimal place
+FIXED: PR random baseline uses correct prevalence
 """
 
 import json
@@ -29,6 +32,16 @@ plt.rcParams.update({
 RESULTS_FILE = "logs/eval_results.jsonl"
 OUT_DIR = "figures"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def _is_detected(action):
+    """Match eval_suite.py logic: blocked OR monitored = detected"""
+    return action.lower() in ["blocked", "block", "hard_block", "monitor", "monitored"]
+
+
+def _is_blocked_only(action):
+    """Only blocked (not monitored)"""
+    return action.lower() in ["blocked", "block", "hard_block"]
 
 
 def load_data():
@@ -78,12 +91,15 @@ def make_fig2_roc_pr(records):
     ax1.grid(True, alpha=0.15, linewidth=0.5)
     ax1.set_aspect('equal')
 
-    # PR — dark red
+    # PR — dark red with CORRECT random baseline
     ax2.plot(recall, precision, color='#C62828', linewidth=1.8,
              label=f'RAG-Shield (AUC = {pr_auc:.3f})')
-    baseline = y_true.sum() / len(y_true)
+    # FIXED: correct prevalence = n_attacks / (n_attacks + n_benign)
+    n_attacks = int(y_true.sum())
+    n_total = len(y_true)
+    baseline = n_attacks / n_total
     ax2.axhline(y=baseline, color='k', linestyle='--', linewidth=0.7,
-                alpha=0.4, label=f'Random ({baseline:.2f})')
+                alpha=0.4, label=f'Random ({baseline:.3f})')
     ax2.fill_between(recall, precision, alpha=0.08, color='#C62828')
     ax2.set_xlabel('Recall')
     ax2.set_ylabel('Precision')
@@ -98,6 +114,7 @@ def make_fig2_roc_pr(records):
     fig.savefig(os.path.join(OUT_DIR, "fig2_roc_pr.pdf"))
     fig.savefig(os.path.join(OUT_DIR, "fig2_roc_pr.png"))
     print(f"Saved: fig2_roc_pr.pdf / .png  (ROC AUC={roc_auc:.4f}, PR AUC={pr_auc:.4f})")
+    print(f"  PR baseline = {n_attacks}/{n_total} = {baseline:.3f}")
     plt.close()
 
 
@@ -108,21 +125,36 @@ def make_fig3_confusion_attribution(records):
     std_attacks = attacks[:200] if len(attacks) >= 200 else attacks
     eva_attacks = attacks[200:] if len(attacks) > 200 else []
 
-    std_tp = sum(1 for r in std_attacks if r.get("action", "").lower() in ["blocked", "block"])
+    # FIXED: Count both BLOCKED and MONITORED as detected (matches eval_suite.py)
+    std_tp = sum(1 for r in std_attacks if _is_detected(r.get("action", "")))
     std_fn = len(std_attacks) - std_tp
-    std_fp = sum(1 for r in benign if r.get("action", "").lower() in ["blocked", "block"])
+    std_fp = sum(1 for r in benign if _is_detected(r.get("action", "")))
     std_tn = len(benign) - std_fp
 
-    eva_tp = sum(1 for r in eva_attacks if r.get("action", "").lower() in ["blocked", "block"])
+    eva_tp = sum(1 for r in eva_attacks if _is_detected(r.get("action", "")))
     eva_fn = len(eva_attacks) - eva_tp
 
     print(f"  Standard: TP={std_tp}, FN={std_fn}, FP={std_fp}, TN={std_tn}")
     print(f"  Evasion:  TP={eva_tp}, FN={eva_fn}")
 
-    std_blocked = [r for r in std_attacks if r.get("action", "").lower() in ["blocked", "block"]]
-    std_layers = Counter(r.get("blocking_layer", "Unknown") for r in std_blocked)
-    eva_blocked = [r for r in eva_attacks if r.get("action", "").lower() in ["blocked", "block"]]
-    eva_layers = Counter(r.get("blocking_layer", "Unknown") for r in eva_blocked)
+    # Layer attribution for detected (blocked OR monitored)
+    std_detected = [r for r in std_attacks if _is_detected(r.get("action", ""))]
+    std_layers = Counter()
+    for r in std_detected:
+        layer = r.get("blocking_layer", None)
+        if layer:
+            std_layers[layer] += 1
+        else:
+            std_layers["Meta Aggregator - Combined Risk"] += 1
+
+    eva_detected = [r for r in eva_attacks if _is_detected(r.get("action", ""))]
+    eva_layers = Counter()
+    for r in eva_detected:
+        layer = r.get("blocking_layer", None)
+        if layer:
+            eva_layers[layer] += 1
+        else:
+            eva_layers["Meta Aggregator - Combined Risk"] += 1
 
     print(f"  Standard layers: {dict(std_layers)}")
     print(f"  Evasion layers:  {dict(eva_layers)}")
@@ -155,7 +187,6 @@ def make_fig3_confusion_attribution(records):
 
 
 def _plot_confusion_color(ax, cm, title):
-    # Professional blue colormap
     from matplotlib.colors import LinearSegmentedColormap
     colors = ['#FFFFFF', '#E3F2FD', '#90CAF9', '#42A5F5', '#1565C0']
     cmap = LinearSegmentedColormap.from_list('blue_pro', colors)
@@ -189,12 +220,11 @@ def _plot_attribution_color(ax, layer_counts, total_tp, title):
         "Meta Aggregator - Combined Risk": "Meta-Agg",
     }
 
-    # Professional color palette
     color_map = {
-        "L1: Anomaly Det.": '#1565C0',   # Dark blue
-        "L2: Intent Cls.": '#E65100',     # Dark orange
-        "L3: Semantic Mon.": '#2E7D32',   # Dark green
-        "Meta-Agg": '#6A1B9A',            # Purple
+        "L1: Anomaly Det.": '#1565C0',
+        "L2: Intent Cls.": '#E65100',
+        "L3: Semantic Mon.": '#2E7D32',
+        "Meta-Agg": '#6A1B9A',
     }
 
     labels = []
@@ -204,7 +234,8 @@ def _plot_attribution_color(ax, layer_counts, total_tp, title):
     for layer, count in layer_counts.most_common():
         short = name_map.get(layer, layer[:15])
         pct = count / total_tp * 100
-        labels.append(f"{short}\n({pct:.0f}%)")
+        # FIXED: Use 1 decimal place for accuracy
+        labels.append(f"{short}\n({pct:.1f}%)")
         sizes.append(count)
         colors.append(color_map.get(short, '#757575'))
 

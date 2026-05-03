@@ -34,8 +34,9 @@ class IntentClassifier:
     Prompt injection classifier with multilingual support.
 
     Stage 1: binary detection
-      - English text -> DeBERTa (primary)
-      - Non-English text -> XLM-RoBERTa zero-shot (fallback)
+      - DeBERTa (primary) on all text
+      - XLM-RoBERTa zero-shot on: non-English, encoding tricks,
+        or when DeBERTa is uncertain (0.30-0.70)
       - Final score = max(deberta_score, multilingual_score)
 
     Stage 2: attack type label (rule-based keywords)
@@ -132,13 +133,28 @@ class IntentClassifier:
         multi_score = 0.0
         source = "deberta"
 
+        # Smart multilingual: run XLM-RoBERTa only when needed
+        # 1. Non-English text (>10% non-ASCII)
+        # 2. Encoding tricks detected (base64, hex, etc.)
+        # 3. DeBERTa is uncertain (score 0.30-0.70)
+        # This avoids false positives on clear benign queries (score ~0.04)
+        run_multi = False
+
         if self._is_non_english(query):
+            run_multi = True
+        elif self._has_encoding_tricks(query):
+            run_multi = True
+        elif 0.30 <= deberta_score <= 0.70:
+            # DeBERTa is uncertain — get second opinion
+            run_multi = True
+
+        if run_multi and self.multi_classifier is not None:
             multi_score = self._multilingual_prob(query)
             if multi_score > deberta_score:
                 source = "xlm-roberta"
-        elif self._has_encoding_tricks(query):
-            multi_score = self._multilingual_prob(query)
-            source = "encoding+deberta"
+
+        if self._has_encoding_tricks(query):
+            source = "encoding+" + source
 
         final_score = max(deberta_score, multi_score)
         return round(final_score, 4), source

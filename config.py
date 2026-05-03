@@ -18,7 +18,7 @@ L1_BLOCK_THRESHOLD = 0.65                  # raised from 0.50 to reduce false
 # ── Layer 2 — Intent Classifier ───────────────────────────────────────────────
 L2_BASE_MODEL        = "microsoft/deberta-v3-base"
 L2_FINETUNED_PATH    = "models/layer2_deberta"
-L2_STAGE1_THRESHOLD  = 0.70   # attack probability above this → blocked
+L2_STAGE1_THRESHOLD = 0.60     # attack probability above this → blocked
 L2_NUM_ATTACK_TYPES  = 6
 
 ATTACK_LABELS = {
@@ -69,7 +69,7 @@ META_HARD_BLOCK_VIOLS  = 2      # boundary violations >= this → hard block
 # Lowered from 0.65/0.40 so L2 attack signal (0.60 weight x 0.82 score = 0.49)
 # crosses the block threshold and triggers BLOCKED.
 META_BLOCK_THRESHOLD   = 0.45   # combined risk above this → blocked
-META_MONITOR_THRESHOLD = 0.25   # combined risk above this → monitor
+META_MONITOR_THRESHOLD = 0.15  # combined risk above this → monitor
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_PATH          = "logs/pipeline.jsonl"

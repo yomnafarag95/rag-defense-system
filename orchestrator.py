@@ -16,17 +16,6 @@ Meta Aggregator
   Model: calibrated LogisticRegressionCV (sklearn)
   Features: 10 signals (layer scores + cross-layer interaction terms)
   Output: calibrated attack probability + action label
-
-Wire into app.py
-────────────────
-  from orchestrator import run_pipeline
-
-  result = run_pipeline(
-      document      = doc_input,
-      query         = query_input,
-      system_prompt = sys_input,
-  )
-  st.session_state.results = result
 """
 
 import json
@@ -50,6 +39,8 @@ from config import (
     MAX_HISTORY_ITEMS,
 )
 
+from keyword_detector import keyword_check
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging setup
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,32 +62,24 @@ class MetaAggregator:
     """
     Learned meta-classifier that combines evidence from all three layers.
 
-    Why learned instead of hand-weighted
-    ─────────────────────────────────────
-    Hand-picked weights assume we know which layer matters most.
-    LogisticRegressionCV learns the optimal weights from real blocked/passed
-    logs. The calibration wrapper ensures the output probabilities are
-    statistically meaningful (not just rankings).
-
     Feature vector (10 dimensions)
     ───────────────────────────────
       l1_max_chunk   : worst individual chunk anomaly score
-      l1_window_max  : worst sliding-window score (payload splitting signal)
+      l1_window_max  : worst sliding-window score
       l1_full        : full-document anomaly score
       l2_stage1      : Layer 2 attack probability
       l2_consistency : query-document lexical consistency
       l3_schema      : 0 if schema valid, 1 if violated
-      l3_boundary    : normalised boundary violation count (capped at 1)
+      l3_boundary    : normalised boundary violation count
       l3_consistency : Layer 3 response consistency risk
       l1xl2          : interaction term (l1_max x l2_stage1)
       l1xl3          : interaction term (l1_full x l3_consistency)
 
     Fallback weights (before model is trained on real logs)
     ────────────────────────────────────────────────────────
-      L2 carries 60% weight — it is the strongest signal before fine-tuning.
+      L2 carries 60% weight.
       A detected attack (L2 ~ 0.82) scores ~0.52, crossing META_BLOCK_THRESHOLD.
       A clean query  (L2 ~ 0.04) scores ~0.03, safely below threshold.
-      XR-500 false positive (L1=1.0, L2=0.04) scores ~0.11 — ALLOW.
     """
 
     def __init__(self):
@@ -115,26 +98,20 @@ class MetaAggregator:
             0.0 if l3["schema_valid"] else 1.0,
             min(len(l3["boundary_violations"]) / max(META_HARD_BLOCK_VIOLS, 1), 1.0),
             l3["consistency_score"],
-            l1["max_score"] * l2["stage1_prob"],        # interaction L1 x L2
-            l1["full_score"] * l3["consistency_score"], # interaction L1 x L3
+            l1["max_score"] * l2["stage1_prob"],
+            l1["full_score"] * l3["consistency_score"],
         ])
-        return f  # 1D array — reshaped to (1,-1) only when passed to sklearn
+        return f
 
     def fit(self, feature_matrix: np.ndarray, labels: list) -> "MetaAggregator":
-        """
-        Train on historical blocked/passed runs.
-        labels: 1 = attack confirmed, 0 = benign confirmed (from human review)
-        """
         self.model.fit(feature_matrix, labels)
         self._fitted = True
         return self
 
-    def predict(self, l1: dict, l2: dict, l3: dict) -> dict:
+    def predict(self, l1: dict, l2: dict, l3: dict, query: str = "") -> dict:
         features = self._features(l1, l2, l3)
 
         # Hard escalation — only boundary violations trigger instant block.
-        # Single-layer scores do NOT hard block to prevent L1 false positives
-        # on technical documents (network specs, product manuals, etc.)
         hard_block = (
             len(l3["boundary_violations"]) >= META_HARD_BLOCK_VIOLS
         )
@@ -151,12 +128,17 @@ class MetaAggregator:
         if self._fitted:
             prob = float(self.model.predict_proba(features.reshape(1, -1))[0][1])
         else:
-            # Fallback weighted sum — used before model is trained on real logs.
-            # L2 weight = 0.60 so a detected attack (L2~0.82) scores ~0.52,
-            # crossing META_BLOCK_THRESHOLD (0.45) and triggering BLOCKED.
+            # Fallback weighted sum
             w = np.array([0.08, 0.04, 0.03, 0.60, 0.04,
                           0.08, 0.06, 0.04, 0.02, 0.01])
             prob = float(np.clip(float(np.dot(features, w)), 0, 1))
+
+        # NEW: Keyword detection boost
+        if query:
+            kw_found, kw_match, kw_boost = keyword_check(query)
+            if kw_found:
+                prob = min(prob + kw_boost, 1.0)
+                logger.info(f"Keyword boost: '{kw_match}' +{kw_boost} -> {prob:.4f}")
 
         prob   = round(prob, 4)
         action = (
@@ -197,9 +179,6 @@ class PipelineLogger:
     """
     Appends every pipeline run to a JSONL log file.
     Each entry contains full evidence vectors for later meta-model retraining.
-
-    confirmed_attack field is filled by human reviewers
-    via a separate review script — not by the pipeline itself.
     """
 
     def __init__(self, path: str = LOG_PATH):
@@ -217,13 +196,12 @@ class PipelineLogger:
             "l3_cs":            result["l3"]["consistency_score"],
             "attack_type":      result["l2"]["stage2_label"],
             "features":         result["meta"]["features"],
-            "confirmed_attack": None,  # filled by human reviewer
+            "confirmed_attack": None,
         }
         with open(self.path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
     def load_confirmed(self) -> tuple:
-        """Load confirmed labels for meta-model retraining."""
         X, y = [], []
         if not self.path.exists():
             return np.array(X), y
@@ -256,18 +234,15 @@ def run_pipeline(document:       str,
     document        : raw KB document text (will be chunked internally)
     query           : user query string
     system_prompt   : system prompt string
-    l1_detector     : AnomalyDetector instance (from layer1_anomaly.py)
-    l2_classifier   : IntentClassifier instance (from layer2_classifier.py)
-    l3_monitor      : BehavioralMonitor instance (from layer3_semantic.py)
-    meta_aggregator : MetaAggregator instance (from this file)
-    raw_response    : optional LLM response string (for Layer 3 output check)
+    l1_detector     : AnomalyDetector instance
+    l2_classifier   : IntentClassifier instance
+    l3_monitor      : BehavioralMonitor instance
+    meta_aggregator : MetaAggregator instance
+    raw_response    : optional LLM response string
 
     Returns
     -------
-    dict with keys matching app.py's st.session_state.results schema:
-        chunks, l1, l2, l3, meta,
-        blocking_layer, blocked, monitored, action,
-        timestamp, query_short
+    dict with keys matching app.py's st.session_state.results schema
     """
     from layer1_anomaly import split_chunks
 
@@ -298,9 +273,9 @@ def run_pipeline(document:       str,
             "l3_monitor is None. Load with load_monitor() and pass to run_pipeline()."
         )
 
-    # Meta aggregator
+    # Meta aggregator — NOW passes query for keyword detection
     agg  = meta_aggregator or MetaAggregator()
-    meta = agg.predict(l1, l2, l3)
+    meta = agg.predict(l1, l2, l3, query=query)
 
     # Determine which layer blocked
     blocking_layer = None
