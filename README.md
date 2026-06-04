@@ -1,9 +1,19 @@
+﻿---
+title: RAG-Shield
+emoji: 🛡️
+colorFrom: blue
+colorTo: red
+sdk: docker
+app_file: src/streamlit_app.py
+pinned: false
+---
+
 <div align="center">
 
 # RAG-Shield
 ### Three-Layer Ensemble Defence Against Prompt Injection in RAG Pipelines
 
-*Queen's University · School of Computing · ITC-Egypt 2026 · IEEE*
+*Queen's University Â· School of Computing Â· ITC-Egypt 2026 Â· IEEE*
 
 [![Paper](https://img.shields.io/badge/IEEE-ITC--Egypt%202026-2b6cb0?style=for-the-badge)](YOUR_PAPER_LINK_HERE)
 [![Python](https://img.shields.io/badge/Python-3.8+-3776ab?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
@@ -24,11 +34,11 @@ RAG systems expose a critical attack surface: adversaries can embed malicious in
 
 | Metric | Value |
 |:---|:---:|
-| ADR — 131 standard attacks | **67.2%** |
-| ADR — 7 evasion probes | **85.7%** |
+| ADR â€” 131 standard attacks | **67.2%** |
+| ADR â€” 7 evasion probes | **85.7%** |
 | Precision | **1.000** |
 | F1 Score | **0.804** |
-| FPR — 553 benign queries | **0.121** |
+| FPR â€” 553 benign queries | **0.121** |
 | AUC-ROC | **0.871** [0.841, 0.898] |
 | Base64 pre-processing block rate | **62.7%** |
 
@@ -38,46 +48,46 @@ RAG systems expose a critical attack surface: adversaries can embed malicious in
 
 ```
 Query + Retrieved Documents + System Prompt
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│  LAYER 1 · Unsupervised Anomaly         │
-│  Isolation Forest + ECOD + One-Class SVM│
-│  Trained on MITRE ATT&CK (no labels).  │
-│  Hard block at score ≥ 0.68.           │
-│  Early exit ~25 ms · Detects 64.8% TP  │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  LAYER 2 · Multilingual Classifier      │
-│  DeBERTa-v3 (86M) + XLM-RoBERTa (560M) │
-│  Applied to query AND document chunks.  │
-│  62.7% Base64 block at pre-processing.  │
-│  Hard block at score ≥ 0.60.           │
-│  Detects 30.7% TP · 66.7% evasion TP   │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  LAYER 3 · Semantic Monitor             │
-│  Schema Validator · 9 regex patterns    │
-│  Boundary Tracker · JWT, AWS, exfil     │
-│  Cross-Encoder · consistency scoring    │
-│  Hard block at boundary violations ≥ 2  │
-│  Detects 4.5% TP · 16.7% evasion TP    │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  META-AGGREGATOR · Logistic Regression  │
-│  10-dim features · isotonic calibration │
-│  Trained on 1,294 logs · SHA-256 verified│
-│  Block θ = 0.45 · Monitor θ = 0.15     │
-└──────────────────┬──────────────────────┘
-                   │
-        ┌──────────┼──────────┐
-        ▼          ▼          ▼
+                    â”‚
+                    â–¼
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  LAYER 1 Â· Unsupervised Anomaly         â”‚
+â”‚  Isolation Forest + ECOD + One-Class SVMâ”‚
+â”‚  Trained on MITRE ATT&CK (no labels).  â”‚
+â”‚  Hard block at score â‰¥ 0.68.           â”‚
+â”‚  Early exit ~25 ms Â· Detects 64.8% TP  â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â”‚
+                   â–¼
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  LAYER 2 Â· Multilingual Classifier      â”‚
+â”‚  DeBERTa-v3 (86M) + XLM-RoBERTa (560M) â”‚
+â”‚  Applied to query AND document chunks.  â”‚
+â”‚  62.7% Base64 block at pre-processing.  â”‚
+â”‚  Hard block at score â‰¥ 0.60.           â”‚
+â”‚  Detects 30.7% TP Â· 66.7% evasion TP   â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â”‚
+                   â–¼
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  LAYER 3 Â· Semantic Monitor             â”‚
+â”‚  Schema Validator Â· 9 regex patterns    â”‚
+â”‚  Boundary Tracker Â· JWT, AWS, exfil     â”‚
+â”‚  Cross-Encoder Â· consistency scoring    â”‚
+â”‚  Hard block at boundary violations â‰¥ 2  â”‚
+â”‚  Detects 4.5% TP Â· 16.7% evasion TP    â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â”‚
+                   â–¼
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  META-AGGREGATOR Â· Logistic Regression  â”‚
+â”‚  10-dim features Â· isotonic calibration â”‚
+â”‚  Trained on 1,294 logs Â· SHA-256 verifiedâ”‚
+â”‚  Block Î¸ = 0.45 Â· Monitor Î¸ = 0.15     â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â”‚
+        â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+        â–¼          â–¼          â–¼
       ALLOW     MONITOR     BLOCK
 ```
 
@@ -124,10 +134,10 @@ RAG-Shield is the only method achieving Precision = 1.000 with competitive ADR a
 | L3 Cross-Encoder | 33 ms | 36 ms |
 | Meta-Aggregator | < 1 ms | < 1 ms |
 | **L1 early exit (clear attacks)** | **25 ms** | **33 ms** |
-| **Full pipeline (CPU)** | **469 ms** | — |
-| GPU (estimated) | ~80–120 ms | — |
+| **Full pipeline (CPU)** | **469 ms** | â€” |
+| GPU (estimated) | ~80â€“120 ms | â€” |
 
-Memory: ~2.1 GB total (MiniLM 90 MB · DeBERTa 740 MB · XLM-RoBERTa 1.1 GB · Cross-encoder 130 MB). INT8 quantisation reduces size 4× with < 2% accuracy loss.
+Memory: ~2.1 GB total (MiniLM 90 MB Â· DeBERTa 740 MB Â· XLM-RoBERTa 1.1 GB Â· Cross-encoder 130 MB). INT8 quantisation reduces size 4Ã— with < 2% accuracy loss.
 
 ---
 
@@ -142,7 +152,7 @@ Memory: ~2.1 GB total (MiniLM 90 MB · DeBERTa 740 MB · XLM-RoBERTa 1.1 GB · C
 | Evasion | Hand-crafted probes | 7 |
 | Meta-aggregator train | Pipeline logs | 1,294 |
 
-Benign queries span HR, finance, IT, code QA, and medical QA — deliberately multi-domain to stress-test the MITRE-trained Layer 1.
+Benign queries span HR, finance, IT, code QA, and medical QA â€” deliberately multi-domain to stress-test the MITRE-trained Layer 1.
 
 ---
 
@@ -150,10 +160,10 @@ Benign queries span HR, finance, IT, code QA, and medical QA — deliberately mu
 
 | Issue | Current Value | Plan |
 |:---|:---:|:---|
-| Benign FPR on multi-domain queries | 0.121 | Domain-specific L1 retraining → target 0.050 |
+| Benign FPR on multi-domain queries | 0.121 | Domain-specific L1 retraining â†’ target 0.050 |
 | Cross-lingual ADR | 0.391 | Fine-tuned multilingual classifier (DE/FR/ZH/AR) |
-| Evasion set size | n = 7 | Expand to n ≥ 50 for reliable CI |
-| CPU latency with I/O | ~2,762 ms | GPU deployment → ~80–120 ms |
+| Evasion set size | n = 7 | Expand to n â‰¥ 50 for reliable CI |
+| CPU latency with I/O | ~2,762 ms | GPU deployment â†’ ~80â€“120 ms |
 | White-box adversarial evaluation | Not run | Surrogate-gradient pipeline (non-differentiable L1) |
 
 ---
@@ -185,25 +195,25 @@ python ablation_study.py
 ## Repository Structure
 
 ```
-├── app.py                     Streamlit interface
-├── orchestrator.py            Main pipeline controller
-├── layer1_anomaly.py          Isolation Forest + ECOD + OCSVM
-├── layer2_classifier.py       DeBERTa-v3 classifier
-├── layer2_multilingual.py     XLM-RoBERTa fallback
-├── layer3_enhanced.py         Schema + boundary + cross-encoder
-├── layer3_semantic.py         Cross-encoder scoring
-├── train_meta_aggregator.py   Meta-aggregator training
-├── ablation_study.py          Per-layer ablation
-├── eval_suite.py              Full evaluation pipeline
-├── bootstrap_ci.py            Bootstrap confidence intervals
-├── fn_analysis.py             False negative analysis
-├── latency_breakdown.py       Latency profiling
-├── config.py                  Thresholds and settings
-├── data_loader.py             Dataset utilities
-├── keyword_detector.py        Baseline blocklist
-├── requirements.txt           Dependencies
-├── Dockerfile                 Docker config
-└── figures/                   Paper figures
+â”œâ”€â”€ app.py                     Streamlit interface
+â”œâ”€â”€ orchestrator.py            Main pipeline controller
+â”œâ”€â”€ layer1_anomaly.py          Isolation Forest + ECOD + OCSVM
+â”œâ”€â”€ layer2_classifier.py       DeBERTa-v3 classifier
+â”œâ”€â”€ layer2_multilingual.py     XLM-RoBERTa fallback
+â”œâ”€â”€ layer3_enhanced.py         Schema + boundary + cross-encoder
+â”œâ”€â”€ layer3_semantic.py         Cross-encoder scoring
+â”œâ”€â”€ train_meta_aggregator.py   Meta-aggregator training
+â”œâ”€â”€ ablation_study.py          Per-layer ablation
+â”œâ”€â”€ eval_suite.py              Full evaluation pipeline
+â”œâ”€â”€ bootstrap_ci.py            Bootstrap confidence intervals
+â”œâ”€â”€ fn_analysis.py             False negative analysis
+â”œâ”€â”€ latency_breakdown.py       Latency profiling
+â”œâ”€â”€ config.py                  Thresholds and settings
+â”œâ”€â”€ data_loader.py             Dataset utilities
+â”œâ”€â”€ keyword_detector.py        Baseline blocklist
+â”œâ”€â”€ requirements.txt           Dependencies
+â”œâ”€â”€ Dockerfile                 Docker config
+â””â”€â”€ figures/                   Paper figures
 ```
 
 ---
@@ -226,13 +236,13 @@ python ablation_study.py
 
 ## Acknowledgements
 
-HuggingFace Transformers · PyOD · scikit-learn · Sentence-Transformers · InjecAgent · HackAPrompt · ITC-Egypt 2026 reviewers
+HuggingFace Transformers Â· PyOD Â· scikit-learn Â· Sentence-Transformers Â· InjecAgent Â· HackAPrompt Â· ITC-Egypt 2026 reviewers
 
 ---
 
 <div align="center">
 <sub>
-Queen's University · School of Computing · Kingston, ON, Canada<br>
-Accepted · ITC-Egypt 2026 · IEEE
+Queen's University Â· School of Computing Â· Kingston, ON, Canada<br>
+Accepted Â· ITC-Egypt 2026 Â· IEEE
 </sub>
 </div>
