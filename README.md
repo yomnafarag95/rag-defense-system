@@ -4,7 +4,7 @@ emoji: 🛡️
 colorFrom: blue
 colorTo: red
 sdk: docker
-app_file: src/streamlit_app.py
+app_port: 8501
 pinned: false
 ---
 
@@ -246,3 +246,4 @@ Queen's University Â· School of Computing Â· Kingston, ON, Canada<br>
 Accepted Â· ITC-Egypt 2026 Â· IEEE
 </sub>
 </div>
+
