@@ -62,10 +62,10 @@ RESULTS_FILE = "logs/eval_results.jsonl"
 OUT_DIR      = "figures"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Must match eval_suite.py dataset sizes
-N_STANDARD = 131
+# Must match eval_suite.py dataset sizes (optimized splits)
+N_STANDARD = 107
 N_EVASION  = 7
-N_BENIGN   = 553
+N_BENIGN   = 47
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,11 +209,21 @@ def make_fig3_confusion_attribution(records: list) -> None:
       (c) Standard layer attribution pie chart with counts
       (d) Evasion layer attribution  pie chart with counts
     """
-    all_attacks = [r for r in records if r["true_label"] == 1]
-    benign      = [r for r in records if r["true_label"] == 0]
-
-    std_attacks = all_attacks[:N_STANDARD]
-    eva_attacks = all_attacks[N_STANDARD: N_STANDARD + N_EVASION]
+    # Dynamically split standard vs evasion attacks based on log sequence order:
+    # Standard attacks are run first (before the first benign log where true_label == 0)
+    # Evasion attacks are run last (after the last benign log where true_label == 0)
+    benign_indices = [idx for idx, r in enumerate(records) if r["true_label"] == 0]
+    if benign_indices:
+        first_benign = benign_indices[0]
+        last_benign  = benign_indices[-1]
+        std_attacks = [r for r in records[:first_benign] if r["true_label"] == 1]
+        eva_attacks = [r for r in records[last_benign + 1:] if r["true_label"] == 1]
+        benign      = [r for r in records if r["true_label"] == 0]
+    else:
+        all_attacks = [r for r in records if r["true_label"] == 1]
+        std_attacks = all_attacks[:N_STANDARD]
+        eva_attacks = all_attacks[N_STANDARD:]
+        benign      = [r for r in records if r["true_label"] == 0]
 
     print(f"  Standard attacks : {len(std_attacks)}  (expected {N_STANDARD})")
     print(f"  Evasion attacks  : {len(eva_attacks)}  (expected {N_EVASION})")
