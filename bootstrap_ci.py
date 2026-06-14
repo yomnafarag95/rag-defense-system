@@ -215,9 +215,9 @@ if __name__ == "__main__":
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result_dict, f, indent=2)
 
-    print(f"\n  Full CI results saved → {out_path}")
+    print(f"\n  Full CI results saved -> {out_path}")
     print(f"\n  Paper-ready Table III update:")
-    print(f"  ─────────────────────────────────────────────────────────")
+    print(f"  ---------------------------------------------------------")
 
     for name, (val, lo, hi) in metrics.items():
         if lo is not None and hi is not None:
