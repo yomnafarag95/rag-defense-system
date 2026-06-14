@@ -1,24 +1,57 @@
 import streamlit as st
 import time
 import re
+import html
+import uuid
 import numpy as np
 from datetime import datetime
 
 from layer1_anomaly    import load_detector
 from layer2_classifier import load_classifier
 from layer3_enhanced   import load_monitor
-from orchestrator      import run_pipeline, MetaAggregator
+from orchestrator      import run_pipeline, MetaAggregator, StatefulAttackTracker
+from canary_manager    import CanaryManager
+from config            import META_BLOCK_THRESHOLD as _CFG_RISK_THRESHOLD
 
 @st.cache_resource
-def get_l1():   return load_detector()
-@st.cache_resource
-def get_l2():   return load_classifier()
-@st.cache_resource
-def get_l3():   return load_monitor()
-@st.cache_resource
-def get_meta(): return MetaAggregator.load()
+def get_canary_manager():
+    """Load the canary manager once (reads token from env)."""
+    try:
+        return CanaryManager()
+    except Exception as exc:
+        return None
 
-SIMULATION_MODE = False
+@st.cache_resource
+def get_l1():
+    try:
+        return load_detector()
+    except Exception as exc:
+        st.error(f"❌ Layer 1 model failed to load: {exc}")
+        return None
+
+@st.cache_resource
+def get_l2():
+    try:
+        return load_classifier()
+    except Exception as exc:
+        st.error(f"❌ Layer 2 model failed to load: {exc}")
+        return None
+
+@st.cache_resource
+def get_l3():
+    try:
+        return load_monitor()
+    except Exception as exc:
+        st.error(f"❌ Layer 3 model failed to load: {exc}")
+        return None
+
+@st.cache_resource
+def get_meta():
+    try:
+        return MetaAggregator.load()
+    except Exception as exc:
+        st.error(f"❌ Meta aggregator failed to load: {exc}")
+        return MetaAggregator()  # untrained fallback
 
 st.set_page_config(page_title="RAG Defense System", page_icon="🛡️", layout="centered")
 
@@ -215,9 +248,8 @@ div[data-baseweb="base-input"] { background: transparent !important; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CHUNK_SIZE     = 200
-# Block threshold lowered to 0.45 so L2 attack score (0.82) triggers BLOCKED
-RISK_THRESHOLD = 0.45
+# CHUNK_SIZE is imported from config.py via split_chunks — not duplicated here.
+RISK_THRESHOLD = _CFG_RISK_THRESHOLD  # keep local alias for simulation mode
 
 INJECTION_PATTERNS = [
     (re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.I), "instruction_override"),
@@ -262,7 +294,11 @@ ICO_WARN   = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke
 
 
 def ev_table(rows):
-    trs = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
+    """Render evidence rows as an HTML table. Values are HTML-escaped to prevent XSS."""
+    trs = "".join(
+        f"<tr><td>{html.escape(str(k))}</td><td>{html.escape(str(v))}</td></tr>"
+        for k, v in rows
+    )
     return f'<table class="ev-table">{trs}</table>'
 
 
@@ -420,9 +456,89 @@ def blocking_name(l1, l2, l3, meta):
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for k, v in [("results", None), ("run_history", []),
-             ("total_runs", 0), ("total_blocked", 0), ("total_monitored", 0)]:
+             ("total_runs", 0), ("total_blocked", 0), ("total_monitored", 0),
+             ("simulation_mode", False), ("session_uuid", str(uuid.uuid4()))]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    st.session_state["simulation_mode"] = st.toggle(
+        "Simulation Mode (no real models)",
+        value=st.session_state["simulation_mode"],
+        help=(
+            "When ON: uses fast heuristic simulation (no GPU needed). "
+            "When OFF: uses real ML models (requires model files)."
+        ),
+    )
+    if st.session_state["simulation_mode"]:
+        st.info("🔬 Simulation mode active — results are illustrative only.")
+    else:
+        st.success("🤖 Live model inference active.")
+
+    # ── Canary Defense Panel ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🎯 Canary Defense")
+    _cm = get_canary_manager()
+    if _cm is not None:
+        _cs = _cm.status_report()
+        if _cs["active"]:
+            st.success(f"✅ Active  \n`token hash: {_cs['token_hash']}`")
+        else:
+            st.warning(
+                "⚠️ Canary token not set.\n\n"
+                "Generate one:\n```\npython -c \"import secrets; "
+                "print('RAG_CANARY_TOKEN=' + secrets.token_hex(16))\"\n```"
+            )
+        st.caption(f"{_cs['templates_available']} honeypot templates available")
+    else:
+        st.error("❌ Canary manager failed to load.")
+
+    # ── Session Threat Level Panel ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📈 Session Threat Level")
+    _tracker   = StatefulAttackTracker()
+    _session_id = st.session_state.get("session_uuid", "")
+    _drift     = _tracker.get_drift_score(_session_id)
+    _hist      = _tracker.get_session_history(_session_id)
+    _trend     = _tracker.get_trend(_session_id)
+
+    _trend_icon = {"rising": "🔺", "falling": "🔻", "stable": "→"}[_trend]
+    _drift_pct  = int(_drift * 100)
+    _drift_color = (
+        "#C0392B" if _drift >= 0.72 else
+        "#B45309" if _drift >= 0.40 else
+        "#27704A"
+    )
+    st.markdown(
+        f"""
+        <div style="background:#F7F5F0;border:1px solid #D4D0C6;
+                    border-radius:10px;padding:14px 16px;margin-bottom:8px;">
+          <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;
+                      color:#7A776E;margin-bottom:6px;">
+            Drift Score {_trend_icon}
+          </div>
+          <div style="font-size:1.8rem;font-weight:600;color:{_drift_color};margin-bottom:6px;">
+            {_drift_pct}%
+          </div>
+          <div style="height:6px;background:#D4D0C6;border-radius:3px;overflow:hidden;">
+            <div style="height:100%;width:{_drift_pct}%;background:{_drift_color};
+                        border-radius:3px;"></div>
+          </div>
+          <div style="font-size:0.68rem;color:#7A776E;margin-top:6px;">
+            {(' → '.join(f'{s:.2f}' for s in _hist)) if _hist else 'No turns yet'}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if _drift >= 0.72:
+        st.error("🚨 Multi-turn drift exceeded threshold. Session BLOCKED.")
+    elif _drift >= 0.40:
+        st.warning("⚠️ Elevated session threat. Monitor closely.")
+    else:
+        st.caption("✅ Session threat level normal.")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
@@ -464,10 +580,13 @@ with tab_pipeline:
     st.markdown("</div>", unsafe_allow_html=True)
 
     if run:
-        if not doc_input.strip() or not query_input.strip():
-            st.warning("Please enter both document content and a query.")
+        if not doc_input.strip():
+            st.error("⚠️ Document content cannot be empty. Please enter some text to scan.")
+        elif not query_input.strip():
+            st.error("⚠️ User query cannot be empty. Please enter a question.")
         else:
             with st.spinner("Running pipeline…"):
+                SIMULATION_MODE = st.session_state.get("simulation_mode", False)
                 if SIMULATION_MODE:
                     time.sleep(0.5)
                     chunks = split_chunks(doc_input)
@@ -476,15 +595,27 @@ with tab_pipeline:
                     l3     = run_layer3(query_input, sys_input, chunks, l1, l2)
                     meta   = run_meta(l1, l2, l3)
                 else:
-                    result = run_pipeline(
-                        document       = doc_input,
-                        query          = query_input,
-                        system_prompt  = sys_input,
-                        l1_detector    = get_l1(),
-                        l2_classifier  = get_l2(),
-                        l3_monitor     = get_l3(),
-                        meta_aggregator= get_meta(),
-                    )
+                    try:
+                        result = run_pipeline(
+                            document        = doc_input,
+                            query           = query_input,
+                            system_prompt   = sys_input,
+                            l1_detector     = get_l1(),
+                            l2_classifier   = get_l2(),
+                            l3_monitor      = get_l3(),
+                            meta_aggregator = get_meta(),
+                            session_id      = st.session_state["session_uuid"],
+                            canary_manager  = get_canary_manager(),
+                        )
+                    except ValueError as ve:
+                        st.error(f"Input error: {ve}")
+                        st.stop()
+                    except RuntimeError as re_err:
+                        st.error(f"Pipeline error: {re_err}")
+                        st.stop()
+                    except Exception as exc:
+                        st.error(f"Unexpected error: {exc}")
+                        st.stop()
                     chunks = result["chunks"]
                     l1     = result["l1"]
                     l2     = result["l2"]
@@ -615,14 +746,14 @@ with tab_pipeline:
         elif r["monitored"]:
             rdot, rtxt = "monitor", "Request flagged and logged for review. Partial response withheld."
         else:
-            rdot, rtxt = "passed",  "John Smith is the CEO of Acme Corp. Q3 revenue was $4.2M."
+            rdot, rtxt = "passed",  "Document passed all defence layers. Response would be generated here."
 
         st.markdown(f"""
         <div class="rag-response">
           <div class="rag-response-label">System Response</div>
           <div class="response-status">
             <div class="response-dot {rdot}"></div>
-            <span>{rtxt}</span>
+            <span>{html.escape(rtxt)}</span>
           </div>
         </div>""", unsafe_allow_html=True)
 

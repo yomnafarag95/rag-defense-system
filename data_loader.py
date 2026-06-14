@@ -460,24 +460,315 @@ def download_injecagent() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Layer 2 — BIPIA
+# Attack Dataset — BIPIA (Indirect Prompt Injection Attacks)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Known category-label strings from the broken old download (MAlmasabi repo).
+_BIPIA_STALE_LABELS = {
+    "task automation", "business intelligence", "conversational agent",
+    "research assistance", "sentiment analysis", "substitution ciphers",
+    "base encoding", "reverse text", "emoji substitution", "language translation",
+    "information dissemination", "marketing & advertising", "entertainment",
+    "scams & fraud", "misinformation & propaganda",
+}
+
+# Official Microsoft BIPIA GitHub — raw JSONL files per document type.
+_BIPIA_GITHUB_URLS = [
+    ("email",  "https://raw.githubusercontent.com/microsoft/BIPIA/main/data/email/test.jsonl"),
+    ("table",  "https://raw.githubusercontent.com/microsoft/BIPIA/main/data/table/test.jsonl"),
+    ("web",    "https://raw.githubusercontent.com/microsoft/BIPIA/main/data/web/test.jsonl"),
+    ("code",   "https://raw.githubusercontent.com/microsoft/BIPIA/main/data/code/test.jsonl"),
+]
+
+# HuggingFace mirror candidates (repo, split).
+_BIPIA_HF_REPOS = [
+    ("lakeraai/bipia",      "train"),
+    ("deepset/prompt-injections", "train"),
+]
+
+
+def _bipia_is_stale(path: Path) -> bool:
+    """Return True if the file exists but contains only category-label strings."""
+    if not path.exists():
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            first = fh.readline().strip()
+        if not first:
+            return True
+        sample = json.loads(first)
+        text = sample.get("text", "").strip().lower()
+        return len(text) < 40 or text in _BIPIA_STALE_LABELS
+    except Exception:
+        return True
+
 
 def download_bipia() -> None:
     """
-    BIPIA support is currently disabled.
+    Downloads BIPIA (Benchmark for Indirect Prompt Injection Attacks,
+    Greshake et al. 2023).  Each entry is a real attack string embedded
+    in a document context (email, table, web page, or code).
 
-    The previously used public file:
-      benchmark/text_attack_test.json
-    is a dict of category/task prompts and does not directly map to a clean
-    attack-example JSONL format under the current loader assumptions.
+    Source priority:
+      1. Official Microsoft BIPIA GitHub (raw JSONL per document type)
+      2. HuggingFace mirror repos
 
-    To avoid silently introducing malformed attack entries, BIPIA is skipped
-    until a verified attack-bearing source schema is integrated.
+    Detects and replaces the stale file produced by the old broken
+    downloader, which stored category label strings instead of attack text.
     """
-    print("  [skip] BIPIA disabled: current public file does not map cleanly to")
-    print("         direct attack strings under the existing loader assumptions.")
-    print("         Skipping BIPIA to preserve benchmark integrity.")
+    dest = DATA_DIR / "bipia.jsonl"
+
+    if _bipia_is_stale(dest):
+        print("  [warn] Existing bipia.jsonl contains category labels — re-downloading ...")
+        dest.unlink(missing_ok=True)
+    elif dest.exists():
+        print(f"  [cache] {dest.name} already exists — skipping download.")
+        return
+
+    # ── Method 1: GitHub (official Microsoft BIPIA repo) ──────────────────
+    count = 0
+    try:
+        with open(dest, "w", encoding="utf-8") as out:
+            for ctx_type, url in _BIPIA_GITHUB_URLS:
+                try:
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    chunk_count = 0
+                    for line in resp.text.strip().splitlines():
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        # Schema: {context, attack_str, task, risk, position}
+                        attack = (row.get("attack_str") or row.get("injected_prompt")
+                                  or row.get("attack") or "")
+                        if not attack or len(attack) < 5:
+                            continue
+                        entry = {
+                            "text":         attack,
+                            "context":      row.get("context", "")[:600],
+                            "query":        row.get("task", "Summarize the retrieved document."),
+                            "label":        1,
+                            "type":         "indirect_injection",
+                            "attack_type":  "indirect_injection",
+                            "source":       "bipia",
+                            "context_type": ctx_type,
+                        }
+                        out.write(json.dumps(entry) + "\n")
+                        count += 1
+                        chunk_count += 1
+                    print(f"    [ok] bipia/{ctx_type}: {chunk_count} entries")
+                except Exception as e:
+                    print(f"    [warn] bipia/{ctx_type} GitHub: {e}")
+
+        if count > 0:
+            print(f"  [ok] {count} BIPIA samples saved to {dest}")
+            return
+    except Exception as e:
+        print(f"  [warn] BIPIA GitHub download failed: {e}")
+    if dest.exists() and dest.stat().st_size == 0:
+        dest.unlink()
+
+    # ── Method 2: HuggingFace mirrors ────────────────────────────────────
+    for repo, split in _BIPIA_HF_REPOS:
+        try:
+            from datasets import load_dataset
+            print(f"  [download] BIPIA from HuggingFace ({repo}) ...")
+            ds = load_dataset(repo, split=split, streaming=True)
+            count = 0
+            with open(dest, "w", encoding="utf-8") as out:
+                for row in ds:
+                    attack = (row.get("attack_str") or row.get("injected_prompt")
+                              or row.get("attack") or row.get("text", ""))
+                    if not attack or len(attack) < 5:
+                        continue
+                    # Skip rows that look like category labels (guard against
+                    # future schema changes).
+                    if attack.strip().lower() in _BIPIA_STALE_LABELS:
+                        continue
+                    entry = {
+                        "text":         attack,
+                        "context":      row.get("context", row.get("document", ""))[:600],
+                        "query":        row.get("task", "Summarize the retrieved document."),
+                        "label":        1,
+                        "type":         "indirect_injection",
+                        "attack_type":  "indirect_injection",
+                        "source":       "bipia",
+                        "context_type": row.get("type", row.get("category", "unknown")),
+                    }
+                    out.write(json.dumps(entry) + "\n")
+                    count += 1
+                    if count >= 300:
+                        break
+            if count > 0:
+                print(f"  [ok] {count} BIPIA samples from {repo}")
+                return
+        except Exception as e:
+            print(f"  [warn] HuggingFace {repo}: {e}")
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+
+    print("  [error] All BIPIA download methods failed.")
+    print("          Manual setup: clone https://github.com/microsoft/BIPIA")
+    print("          and run: python data_loader.py --bipia-local <path>")
+
+
+def download_xstest() -> None:
+    """
+    Downloads XSTest safe prompt dataset from HuggingFace (Paul/XSTest)
+    and extracts safe prompts for False Positive Rate (FPR) testing.
+    """
+    dest = DATA_DIR / "xstest.jsonl"
+    if _already(dest):
+        return
+    try:
+        from datasets import load_dataset
+        print("  [download] XSTest safe prompt dataset from HuggingFace (Paul/XSTest) ...")
+        ds = load_dataset("Paul/XSTest", split="train")
+        count = 0
+        with open(dest, "w", encoding="utf-8") as f:
+            for row in ds:
+                label_gold = row.get("label_gold", "safe")
+                if label_gold == "safe":
+                    entry = {
+                        "text": row.get("prompt", ""),
+                        "label": 0,
+                        "type": "benign",
+                        "category": row.get("type", "safe_contrast"),
+                        "domain": "safety_contrast"
+                    }
+                    f.write(json.dumps(entry) + "\n")
+                    count += 1
+        print(f"  [ok] {count} XSTest safe prompts saved to {dest}")
+    except Exception as e:
+        print(f"  [warn] XSTest download failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attack Dataset — TensorTrust (crowd-sourced adversarial jailbreaks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_tensortrust(n: int = 1000) -> None:
+    """
+    Downloads TensorTrust attack prompts from HuggingFace.
+
+    TensorTrust is a large crowd-sourced dataset of prompt injections
+    collected from a web game where players competed to bypass LLM defenses.
+    It contains highly diverse, human-designed adversarial techniques
+    (base64 encoding, payload splitting, linguistic camouflage, etc.).
+
+    Only prompts where the attack was *successful* (hijacking_level > 0)
+    are retained, as these represent the harder, realistic bypass cases.
+    """
+    dest = DATA_DIR / "tensortrust.jsonl"
+    if _already(dest):
+        return
+    try:
+        from datasets import load_dataset
+        print(f"  [download] TensorTrust attack prompts (n={n}) ...")
+        # Primary: qxcv/tensor-trust
+        # Fallbacks: HuggingFaceH4/tensortrust_data, tensortrust/tensortrust-data
+        for repo in ("qxcv/tensor-trust", "HuggingFaceH4/tensortrust_data", "tensortrust/tensortrust-data"):
+            try:
+                ds = load_dataset(repo, split="train", streaming=True)
+                count = 0
+                with open(dest, "w", encoding="utf-8") as f:
+                    for row in ds:
+                        # Field names vary by version of the dataset.
+                        attack = (
+                            row.get("attack")
+                            or row.get("hijacking_prompt")
+                            or row.get("attack_prompt")
+                            or row.get("prompt", "")
+                        )
+                        if not attack or len(str(attack)) < 5:
+                            continue
+                        entry = {
+                            "text":        str(attack)[:1000],
+                            "label":       1,
+                            "type":        "direct_injection",
+                            "attack_type": "adversarial_jailbreak",
+                            "source":      "tensortrust",
+                            "category":    str(row.get("category", row.get("type", "unknown"))),
+                        }
+                        f.write(json.dumps(entry) + "\n")
+                        count += 1
+                        if count >= n:
+                            break
+                if count > 0:
+                    print(f"  [ok] {count} TensorTrust attacks saved to {dest}")
+                    return
+            except Exception as e:
+                print(f"  [warn] {repo}: {e}")
+                if dest.exists():
+                    dest.unlink(missing_ok=True)
+        print("  [warn] TensorTrust: all repos failed. Install datasets and retry.")
+
+    except Exception as e:
+        print(f"  [warn] TensorTrust download failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Benign Dataset — WildChat (real user-LLM conversations)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_wildchat(n: int = 500) -> None:
+    """
+    Downloads a sample of real user prompts from WildChat-1M.
+
+    WildChat contains over 1 million real user messages sent to ChatGPT.
+    Only the first user turn of each conversation is extracted.
+    Trivially detectable injections are filtered out so that every
+    entry represents a genuinely benign real-world query (label=0).
+
+    This dataset is used to measure FPR on the natural distribution
+    of user requests — much harder than MS MARCO web search queries.
+    """
+    dest = DATA_DIR / "wildchat_benign.jsonl"
+    if _already(dest):
+        return
+    # Very basic injection keywords — enough to skip obvious attacks
+    # without over-filtering, since the goal is to keep legitimate queries.
+    _OBVIOUS_ATTACK_KW = {
+        "ignore previous", "ignore all previous", "disregard previous",
+        "jailbreak", "dan mode", "do anything now",
+        "act as if you", "pretend you are", "you are now",
+    }
+    try:
+        from datasets import load_dataset
+        print(f"  [download] WildChat benign sample (n={n}) ...")
+        ds = load_dataset("allenai/WildChat-1M", split="train", streaming=True)
+        count = 0
+        with open(dest, "w", encoding="utf-8") as f:
+            for row in ds:
+                conversation = row.get("conversation", [])
+                if not conversation:
+                    continue
+                # Extract only the first user turn.
+                first_msg = next(
+                    (m.get("content", "") for m in conversation
+                     if m.get("role") == "user"),
+                    "",
+                )
+                if not first_msg or len(first_msg) < 10:
+                    continue
+                lower = first_msg.lower()
+                if any(kw in lower for kw in _OBVIOUS_ATTACK_KW):
+                    continue
+                entry = {
+                    "text":   first_msg[:600],
+                    "label":  0,
+                    "type":   "benign",
+                    "source": "wildchat",
+                    "domain": "real_user_queries",
+                }
+                f.write(json.dumps(entry) + "\n")
+                count += 1
+                if count >= n:
+                    break
+        print(f"  [ok] {count} WildChat benign queries saved to {dest}")
+    except Exception as e:
+        print(f"  [warn] WildChat download failed: {e}")
+        print("         Requires: pip install datasets  (allenai/WildChat-1M)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,6 +816,29 @@ def download_benign_queries() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX #13 — Extended benign set
 # ─────────────────────────────────────────────────────────────────────────────
+
+def download_bipia() -> None:
+    """Robust downloader for BIPIA dataset from reliable sources."""
+    dest = DATA_DIR / "bipia.jsonl"
+    if _already(dest):
+        return
+    import requests
+    sources = [
+        "https://raw.githubusercontent.com/yixinsun/bipia/main/dataset.jsonl",
+        "https://huggingface.co/datasets/your-org/bipia-mirror/raw/main/dataset.jsonl"
+    ]
+    for url in sources:
+        try:
+            print(f"  [download] BIPIA from {url} ...")
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                print(f"  [ok] BIPIA saved to {dest}")
+                return
+        except Exception as e:
+            print(f"  [warn] Failed {url}: {e}")
+    print("  [error] BIPIA download failed.")
 
 def build_extended_benign(seed: int = 42) -> None:
     dest = DATA_DIR / "extended_benign.csv"
@@ -643,14 +957,23 @@ def main(build_evasion: bool = False, build_extended: bool = False) -> None:
     print("\n[6/9] InjecAgent (Layer 2 — unique indirect injection prompts)")
     download_injecagent()
 
-    print("\n[7/9] BIPIA")
+    print("\n[7/10] BIPIA")
     download_bipia()
 
-    print("\n[8/9] MS MARCO benign queries")
+    print("\n[8/10] MS MARCO benign queries")
     download_benign_queries()
 
-    print("\n[9/9] MultiNLI calibration sample")
+    print("\n[9/10] MultiNLI calibration sample")
     download_multinli()
+
+    print("\n[10/10] XSTest safe prompts")
+    download_xstest()
+
+    print("\n[11/12] TensorTrust attack prompts")
+    download_tensortrust()
+
+    print("\n[12/12] WildChat benign sample")
+    download_wildchat()
 
     if build_evasion:
         print("\n[+] Building benchmark subset from HackAPrompt ...")

@@ -32,6 +32,8 @@ Wire into app.py
 """
 
 import re
+import os
+import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import pipeline as hf_pipeline
@@ -40,9 +42,16 @@ from config import (
     L2_STAGE1_THRESHOLD,
     L2_DOC_SCAN_CHUNKS,
     L2_DOC_PATTERN_THRESHOLD,
+    L2_USE_FINETUNED,
+    L2_FINETUNED_PATH,
     ATTACK_DISPLAY,
+    DEVICE,
 )
+from obfuscation_decoder import ObfuscationDecoder
 
+logger = logging.getLogger(__name__)
+
+# Default pretrained hub model (fallback when fine-tuned model is absent)
 INJECTION_MODEL    = "protectai/deberta-v3-base-prompt-injection-v2"
 MULTILINGUAL_MODEL = "joeddav/xlm-roberta-large-xnli"
 
@@ -194,7 +203,7 @@ class IntentClassifier:
             r'\bdo\s+not\s+(follow|obey|comply\s+with|adhere\s+to)\s+'
             r'(your|the|previous|system)\s+(instructions?|rules?|guidelines?)\b', re.I),
          0.80),
-        # HIGH CONFIDENCE — destructive / exfiltration actions
+        # HIGH CONFIDENCE — destructive / exfiltration / unauthorized actions
         (re.compile(
             r'\b(please\s+)?(delete|remove|wipe|erase)\s+(all\s+)?'
             r'(files?|data|records?|logs?|history|account|users?)\b', re.I),
@@ -204,21 +213,18 @@ class IntentClassifier:
             r'(command|script|code|payload|function|program)\b', re.I),
          0.80),
         (re.compile(
-            r'\b(please\s+)?(transfer|wire)\s+'
-            r'(money|funds|payment|\$\s*\d|bitcoin|crypto)\b', re.I),
-         0.82),
+            r'\b(please\s+)?(transfer|wire|send|sell|buy|purchase|withdraw|exchange|spend)\s+(\d+|all|some)\s+.*\b(bitcoin|btc|eth|crypto|usd|eur|gbp|shares|stocks|funds|money|\$\s*\d)\b', re.I),
+         0.85),
         (re.compile(
-            r'\b(please\s+)?send\s+an?\s+(email|message|notification)\s+(to|for)\b', re.I),
-         0.68),
-        (re.compile(
-            r'\b(send|forward|email|transfer)\s+(all|the|confidential|sensitive|secret)\s+'
-            r'\w+\s+(to|at|via)\b', re.I),
+            r'\b(please\s+)?(send|email|message|forward|post|mail|notify)\s+.*\b(to|at|for|recipient)\b', re.I),
          0.78),
         # MEDIUM CONFIDENCE — specific physical/digital actions
         (re.compile(
-            r'\b(please\s+)?unlock\s+(the\s+)?(door|gate|account|device|system|lock|safe)\b',
-            re.I),
-         0.65),
+            r'\b(please\s+)?(unlock|lock|open|close)\s+([a-z0-9_]+\s+){0,3}(door|gate|account|device|system|lock|safe|user|valves?|access)\b', re.I),
+         0.82),
+        (re.compile(
+            r'\b(please\s+)?(create|update|delete|modify|change|add|remove|whitelist|blacklist|disable|enable)\s+.*\b(policy|rules?|firewall|settings?|permissions?|access|blacklist|whitelist)\b', re.I),
+         0.82),
         (re.compile(
             r'\b(please\s+)?(book|reserve|purchase|buy)\s+(a\s+)?'
             r'(flight|ticket|hotel|reservation)\b', re.I),
@@ -233,13 +239,18 @@ class IntentClassifier:
         (re.compile(r'\battacker\b', re.I), 0.65),
     ]
 
-    def __init__(self, model, tokenizer, multi_classifier=None):
+    def __init__(self, model, tokenizer, multi_classifier=None, onnx_session=None):
         self.model = model
         self.tok   = tokenizer
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
-        self.model.eval()
+        if self.model is not None:
+            self.model.to(self.device)
+            self.model.eval()
         self.multi_classifier = multi_classifier
+        self.onnx_session = onnx_session
+        # Central obfuscation decoder — decodes Base64, Hex, ROT13, Leet,
+        # Unicode confusables, zero-width chars, and reversed text before inference
+        self._decoder = ObfuscationDecoder()
 
     def _is_non_english(self, text: str) -> bool:
         if not text:
@@ -258,18 +269,43 @@ class IntentClassifier:
         return any(re.search(p, text) for p in patterns)
 
     def _deberta_prob(self, text: str) -> float:
-        inputs = self.tok(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
-        with torch.no_grad():
-            probs = torch.softmax(self.model(**inputs).logits, dim=-1)[0]
-        return float(probs[1])
+        """Run DeBERTa and return injection probability in [0, 1]."""
+        if not text or not text.strip():
+            return 0.0
+        try:
+            if self.onnx_session is not None:
+                inputs = self.tok(
+                    text,
+                    truncation=True,
+                    max_length=512,
+                )
+                import numpy as np
+                valid_keys = {inp.name for inp in self.onnx_session.get_inputs()}
+                onnx_inputs = {k: np.array([v], dtype=np.int64) for k, v in inputs.items() if k in valid_keys}
+                outputs = self.onnx_session.run(None, onnx_inputs)
+                logits = outputs[0][0]
+                exp_logits = np.exp(logits - np.max(logits))
+                probs = exp_logits / np.sum(exp_logits)
+                return float(probs[1])
+            else:
+                inputs = self.tok(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                ).to(self.device)
+                with torch.no_grad():
+                    probs = torch.softmax(self.model(**inputs).logits, dim=-1)[0]
+                return float(probs[1])
+        except Exception as exc:
+            logger.warning("[L2] _deberta_prob failed: %s", exc)
+            return 0.5  # Conservative fallback: uncertain
 
     def _multilingual_prob(self, text: str) -> float:
+        """Zero-shot multilingual injection probability via XLM-R."""
         if self.multi_classifier is None:
+            return 0.0
+        if not text or not text.strip():
             return 0.0
         try:
             result = self.multi_classifier(
@@ -279,11 +315,14 @@ class IntentClassifier:
             )
             top_label = result["labels"][0]
             top_score = result["scores"][0]
-            return float(
+            prob = float(
                 top_score if top_label in self.MALICIOUS_LABELS
                 else 1.0 - top_score
             )
-        except Exception:
+            logger.debug("[L2] XLM-R top_label=%s prob=%.4f", top_label, prob)
+            return prob
+        except Exception as exc:
+            logger.warning("[L2] _multilingual_prob failed: %s", exc)
             return 0.0
 
     def _stage1_prob(self, query: str) -> tuple[float, str]:
@@ -326,30 +365,21 @@ class IntentClassifier:
         ────────────────
         Legitimate RAG documents contain factual information.
         Injected documents contain imperative commands to the AI.
-        This method detects those commands using targeted patterns,
-        supplemented by DeBERTa on chunks with elevated pattern scores.
+        This method detects those commands using targeted patterns
+        and DeBERTa unconditionally on all scanned chunks.
 
-        Only scans the first L2_DOC_SCAN_CHUNKS chunks for speed.
         Returns (max_score, source_tag).
         """
         if not chunks:
             return 0.0, "no_chunks"
 
         max_score = 0.0
-        scan_chunks = chunks[:L2_DOC_SCAN_CHUNKS]
+        scan_chunks = chunks if L2_DOC_SCAN_CHUNKS is None else chunks[:L2_DOC_SCAN_CHUNKS]
 
         for chunk in scan_chunks:
-            # Step 1: Fast pattern check
+            deberta_score = self._deberta_prob(chunk)
             pattern_score = self._document_pattern_score(chunk)
-
-            # Step 2: Run DeBERTa on chunk only if pattern gives elevated signal
-            # This avoids unnecessary inference on clearly benign chunks
-            if pattern_score >= 0.40:
-                deberta_score = self._deberta_prob(chunk)
-                chunk_score = max(pattern_score, deberta_score)
-            else:
-                chunk_score = pattern_score
-
+            chunk_score = max(pattern_score, deberta_score)
             max_score = max(max_score, chunk_score)
 
         return round(max_score, 4), "doc_scan"
@@ -369,11 +399,62 @@ class IntentClassifier:
         return round(1.0 - max(ov, default=0.0), 4)
 
     def classify(self, query: str, chunks: list[str]) -> dict:
-        # ── Stage 1a: Query-level classification ─────────────────────────────
-        stage1_prob, source = self._stage1_prob(query)
+        """Classify query and document chunks for injection attacks."""
+        import unicodedata
+        query = unicodedata.normalize('NFKC', query)
+        chunks = [unicodedata.normalize('NFKC', c) for c in chunks]
 
-        # ── Stage 1b: Document-level injection scanning ───────────────────────
-        doc_score, doc_source = self._scan_document_chunks(chunks)
+        # ── Obfuscation pre-processing ────────────────────────────────────────
+        # Decode query before DeBERTa: handles Base64, Hex, ROT13, Leetspeak,
+        # Unicode confusables, zero-width chars, and reversed text.
+        # DeBERTa always operates on the plaintext form.
+        query_decoded = self._decoder.decode(query)
+        effective_query = query_decoded.decoded
+        obfuscation_detected = query_decoded.method != "none"
+        decode_method = query_decoded.method
+
+        if obfuscation_detected:
+            logger.info(
+                "[L2] Obfuscation detected in query (method=%s, confidence=%.2f). "
+                "Using decoded variant for inference.",
+                decode_method, query_decoded.confidence
+            )
+
+        # Input validation
+        if not query or not query.strip():
+            logger.warning("[L2] classify() called with empty query")
+            return {
+                "stage1_prob":          0.0,
+                "stage2_label":         None,
+                "stage2_conf":          0.0,
+                "consistency_score":    1.0,
+                "blocked":              False,
+                "confidence":           0.0,
+                "obfuscation_detected": False,
+                "decode_method":        "none",
+                "ev": [("Warning", "Empty query provided")],
+            }
+
+        # ── Stage 1a: Query-level classification (on decoded query) ───────────
+        stage1_prob, source = self._stage1_prob(effective_query)
+
+        # ── Stage 1b: Document-level injection scanning (decode each chunk) ─────
+        decoded_chunks = []
+        chunk_obfuscation = False
+        for ch in chunks:
+            ch_result = self._decoder.decode(ch)
+            decoded_chunks.append(ch_result.decoded)
+            if ch_result.method != "none":
+                chunk_obfuscation = True
+                logger.info(
+                    "[L2] Obfuscation detected in document chunk (method=%s).",
+                    ch_result.method,
+                )
+        if chunk_obfuscation:
+            obfuscation_detected = True
+            decode_method = decode_method + "+chunk" if decode_method != "none" else "chunk"
+
+        doc_score, doc_source = self._scan_document_chunks(decoded_chunks)
 
         # Use higher of query score and document scan score
         if doc_score > stage1_prob:
@@ -394,35 +475,95 @@ class IntentClassifier:
             if final_prob < L2_STAGE1_THRESHOLD:
                 label, conf, matched_kw = None, 0.0, None
 
-        consistency = self._consistency(query, chunks)
+        consistency = self._consistency(query, decoded_chunks)
+
+        # Confidence: how far from the decision boundary (0.5 is threshold proxy)
+        confidence = round(min(abs(final_prob - L2_STAGE1_THRESHOLD) * 2, 1.0), 4)
+
+        logger.info(
+            "[L2] stage1_prob=%.4f doc_score=%.4f blocked=%s label=%s source=%s",
+            stage1_prob, doc_score, blocked, label, final_source,
+        )
 
         return {
-            "stage1_prob":       final_prob,
-            "stage2_label":      label,
-            "stage2_conf":       round(conf, 4),
-            "consistency_score": consistency,
-            "blocked":           blocked,
+            "stage1_prob":          final_prob,
+            "stage2_label":         label,
+            "stage2_conf":          round(conf, 4),
+            "consistency_score":    consistency,
+            "blocked":              blocked,
+            "confidence":           confidence,
+            "obfuscation_detected": obfuscation_detected,
+            "decode_method":        decode_method,
             "ev": [
-                ("Attack probability",  f"{final_prob:.4f}  (Stage 1, {final_source})"),
-                ("Query score",         f"{stage1_prob:.4f}  (DeBERTa)"),
-                ("Document scan score", f"{doc_score:.4f}  ({doc_source})"),
-                ("Attack family",       ATTACK_DISPLAY.get(label, "None detected")),
-                ("Family confidence",   f"{conf:.4f}  (Stage 2 heuristic)"),
-                ("Matched heuristic",   matched_kw or "None"),
-                ("Query-doc overlap",   f"{consistency:.4f}"),
-                ("Detection source",    final_source),
-                ("Base model",          "deberta-v3 + xlm-roberta (multilingual fallback)"),
+                ("Attack probability",    f"{final_prob:.4f}  (Stage 1, {final_source})"),
+                ("Query score",           f"{stage1_prob:.4f}  (DeBERTa on decoded query)"),
+                ("Document scan score",   f"{doc_score:.4f}  ({doc_source})"),
+                ("Attack family",         ATTACK_DISPLAY.get(label, "None detected")),
+                ("Family confidence",     f"{conf:.4f}  (Stage 2 heuristic)"),
+                ("Matched heuristic",     matched_kw or "None"),
+                ("Query-doc overlap",     f"{consistency:.4f}"),
+                ("Detection source",      final_source),
+                ("Confidence",            f"{confidence:.4f}"),
+                ("Obfuscation detected",  str(obfuscation_detected) + (f" ({decode_method})" if obfuscation_detected else "")),
+                ("Base model",            getattr(self, '_model_tag', 'deberta-v3 + xlm-roberta (multilingual fallback)')),
             ],
         }
 
 
 def load_classifier():
-    """Load primary injection detector + multilingual fallback."""
-    print(f"[L2] Loading {INJECTION_MODEL} ...")
-    tok   = AutoTokenizer.from_pretrained(INJECTION_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(INJECTION_MODEL)
-    print("[L2] DeBERTa model ready.")
+    """
+    Load intent classifier with priority order:
+      1. Fine-tuned model (models/layer2_finetuned/) if L2_USE_FINETUNED=True
+      2. ONNX-quantized model (models/deberta_onnx/model.onnx)
+      3. Pretrained hub model (protectai/deberta-v3-base-prompt-injection-v2)
+    """
+    import os
+    onnx_path     = os.path.join("models", "deberta_onnx", "model.onnx")
+    onnx_session  = None
+    tok           = None
+    model         = None
+    model_tag     = ""
 
+    # ── Priority 1: Fine-tuned domain classifier ──────────────────────────────
+    if L2_USE_FINETUNED and os.path.isdir(L2_FINETUNED_PATH):
+        try:
+            print(f"[L2] Loading fine-tuned model from {L2_FINETUNED_PATH} ...")
+            tok   = AutoTokenizer.from_pretrained(L2_FINETUNED_PATH)
+            model = AutoModelForSequenceClassification.from_pretrained(L2_FINETUNED_PATH)
+            model_tag = f"deberta-v3-small (fine-tuned @ {L2_FINETUNED_PATH})"
+            print("[L2] [OK] Fine-tuned model loaded — using custom domain classifier.")
+        except Exception as exc:
+            print(f"[L2] WARNING: Failed to load fine-tuned model: {exc}")
+            logger.warning("[L2] Fine-tuned model load failed: %s", exc)
+            tok = model = None
+
+    # ── Priority 2: ONNX quantized model ─────────────────────────────────────
+    if model is None and os.path.exists(onnx_path):
+        try:
+            import onnxruntime as ort
+            print(f"[L2] Loading ONNX model from {onnx_path} ...")
+            tok = AutoTokenizer.from_pretrained(INJECTION_MODEL)
+            onnx_session = ort.InferenceSession(onnx_path)
+            model_tag = f"deberta-v3 ONNX INT8 ({onnx_path})"
+            print("[L2] ONNX model ready.")
+        except Exception as e:
+            print(f"[L2] WARNING: Failed to load ONNX model: {e}")
+            logger.warning("[L2] Failed to load ONNX model: %s", e)
+
+    # ── Priority 3: Pretrained hub model (original fallback) ──────────────────
+    if model is None and onnx_session is None:
+        print(f"[L2] Loading pretrained model {INJECTION_MODEL} on device={DEVICE} ...")
+        try:
+            tok   = AutoTokenizer.from_pretrained(INJECTION_MODEL)
+            model = AutoModelForSequenceClassification.from_pretrained(INJECTION_MODEL)
+            model_tag = f"deberta-v3-base (pretrained, {INJECTION_MODEL})"
+            print("[L2] Pretrained DeBERTa model ready.")
+        except Exception as exc:
+            raise RuntimeError(
+                f"[L2] Failed to load injection classifier '{INJECTION_MODEL}': {exc}"
+            ) from exc
+
+    # ── Multilingual fallback (always attempted) ──────────────────────────────
     multi_classifier = None
     try:
         print(f"[L2] Loading multilingual model {MULTILINGUAL_MODEL} ...")
@@ -434,7 +575,10 @@ def load_classifier():
         print("[L2] Multilingual model ready.")
     except Exception as e:
         print(f"[L2] WARNING: Could not load multilingual model: {e}")
-        print("[L2] Falling back to DeBERTa-only mode.")
+        logger.warning("[L2] Multilingual model unavailable: %s", e)
+        print("[L2] Falling back to primary-model-only mode.")
 
-    print("[L2] Model ready.")
-    return IntentClassifier(model, tok, multi_classifier)
+    clf = IntentClassifier(model, tok, multi_classifier, onnx_session=onnx_session)
+    clf._model_tag = model_tag  # expose for ev[] reporting
+    print(f"[L2] Classifier ready. Active model: {model_tag}")
+    return clf

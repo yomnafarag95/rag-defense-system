@@ -133,17 +133,17 @@ if __name__ == "__main__":
     print(f"  Benign entries : {len(benign_entries)}\n")
 
     # Extract vectors
-    yt_atk  = [e["true_label"] for e in attack_entries]
-    yp_atk  = [e["pred_label"] for e in attack_entries]
-    ypr_atk = [e["risk_score"]  for e in attack_entries]
+    yt_atk  = [e["true_label"]     for e in attack_entries]
+    yp_atk  = [e["pred_prevented"] for e in attack_entries]  # fixed: was pred_label (non-existent field)
+    ypr_atk = [e["risk_score"]     for e in attack_entries]
 
-    yt_ben  = [e["true_label"] for e in benign_entries]
-    yp_ben  = [e["pred_label"] for e in benign_entries]
-    ypr_ben = [e["risk_score"]  for e in benign_entries]
+    yt_ben  = [e["true_label"]     for e in benign_entries]
+    yp_ben  = [e["pred_prevented"] for e in benign_entries]  # fixed: was pred_label
+    ypr_ben = [e["risk_score"]     for e in benign_entries]
 
-    yt_all  = [e["true_label"] for e in entries]
-    yp_all  = [e["pred_label"] for e in entries]
-    ypr_all = [e["risk_score"]  for e in entries]
+    yt_all  = [e["true_label"]     for e in entries]
+    yp_all  = [e["pred_prevented"] for e in entries]         # fixed: was pred_label
+    ypr_all = [e["risk_score"]     for e in entries]
 
     N_BOOTSTRAP = 10_000
     print(f"  Running {N_BOOTSTRAP:,} bootstrap resamples per metric ...")

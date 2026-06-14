@@ -1,4 +1,4 @@
-﻿# Core app
+# Core app
 streamlit==1.32.0
 pydantic==2.7.1
 python-dotenv==1.0.1
@@ -16,6 +16,11 @@ transformers==4.35.2
 tokenizers==0.15.2
 safetensors==0.4.2
 sentencepiece==0.2.0
+
+# ONNX / Quantization (for quantize_onnx.py — Tier 2 Item 3)
+onnx>=1.16.0
+onnxruntime>=1.18.0
+# optimum[onnxruntime]  # optional: richer quantization; uncomment if needed
 
 # Data
 datasets==2.18.0

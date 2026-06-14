@@ -31,32 +31,14 @@ Wire into app.py
   result   = detector.scan(chunks)
 """
 
-from huggingface_hub import hf_hub_download
-import os
-
-
-def load_or_download_models():
-    if not os.path.exists("models/"):
-        os.makedirs("models/")
-    files = [
-        "layer1_models.pkl.iforest.pkl",
-        "layer1_models.pkl.ecod.pkl",
-        "layer1_models.pkl.svm.pkl",
-        "layer1_models.pkl.threshold.pkl",
-    ]
-    for f in files:
-        if not os.path.exists(f"models/{f}"):
-            hf_hub_download(
-                repo_id="yomnafarag95/rag-defense-models",
-                filename=f,
-                local_dir="models/",
-            )
-
-
 import json
+import logging
+import os
 import numpy as np
 from pathlib import Path
 from typing import Optional
+
+from huggingface_hub import hf_hub_download
 
 from config import (
     L1_MODELS_PATH,
@@ -65,10 +47,41 @@ from config import (
     CHUNK_OVERLAP,
 )
 
+logger = logging.getLogger(__name__)
+
 # Max samples to train OneClassSVM on.
 # Limits support vector count → keeps inference fast.
 # ECOD and IForest still use the full corpus.
 _SVM_MAX_TRAIN_SAMPLES = 2000
+
+
+def load_or_download_models():
+    """Download model component files from HuggingFace if not already present."""
+    # Resolve models/ directory relative to this file, not the cwd.
+    models_dir = Path(L1_MODELS_PATH).parent
+    models_dir.mkdir(parents=True, exist_ok=True)
+    files = [
+        "layer1_models.pkl.iforest.pkl",
+        "layer1_models.pkl.ecod.pkl",
+        "layer1_models.pkl.svm.pkl",
+        "layer1_models.pkl.threshold.pkl",
+    ]
+    for f in files:
+        dest = models_dir / f
+        if not dest.exists():
+            logger.info("[L1] Downloading %s from HuggingFace ...", f)
+            try:
+                hf_hub_download(
+                    repo_id="yomnafarag95/rag-defense-models",
+                    filename=f,
+                    local_dir=str(models_dir),
+                )
+            except Exception as exc:
+                logger.error("[L1] Failed to download %s: %s", f, exc)
+                raise RuntimeError(
+                    f"Could not download model file '{f}'. "
+                    "Check your internet connection and HuggingFace credentials."
+                ) from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +162,10 @@ class EnsembleDetector:
         self.iforest = IForest(contamination=0.08, random_state=42)
         self.svm     = OneClassSVM(nu=0.08, kernel="rbf", gamma="scale")
         self.threshold: Optional[float] = None
+        
+        self._ecod_bounds: Optional[tuple[float, float]] = None
+        self._iforest_bounds: Optional[tuple[float, float]] = None
+        self._svm_bounds: Optional[tuple[float, float]] = None
 
     def fit(self, embeddings: np.ndarray,
             threshold: float = L1_BLOCK_THRESHOLD) -> "EnsembleDetector":
@@ -160,10 +177,6 @@ class EnsembleDetector:
         self.iforest.fit(embeddings)
 
         # ── SVM subsampling for inference speed ───────────────────────────────
-        # OneClassSVM scoring is O(n_support_vectors).
-        # nu=0.08 on 8058 samples → ~645 support vectors → ~2600ms per query.
-        # Subsampling to 2000 → ~160 support vectors → ~200ms per query.
-        # ECOD and IForest are not subsampled — they scale well.
         if len(embeddings) > _SVM_MAX_TRAIN_SAMPLES:
             rng = np.random.RandomState(42)
             idx = rng.choice(len(embeddings), _SVM_MAX_TRAIN_SAMPLES, replace=False)
@@ -178,22 +191,42 @@ class EnsembleDetector:
 
         self.svm.fit(svm_emb)
         self.threshold = threshold
+
+        # ── Compute score bounds on training data for non-transductive normalization ─
+        print("[L1] Computing bounds on training data ...")
+        raw_ecod = self.ecod.decision_function(embeddings)
+        self._ecod_bounds = (float(raw_ecod.min()), float(raw_ecod.max()))
+
+        raw_iforest = self.iforest.decision_function(embeddings)
+        self._iforest_bounds = (float(raw_iforest.min()), float(raw_iforest.max()))
+
+        # SVM subset or full corpus? Let's use svm_emb because svm was fit on it.
+        raw_svm = -self.svm.decision_function(svm_emb)
+        self._svm_bounds = (float(raw_svm.min()), float(raw_svm.max()))
+
+        print(f"[L1] ECOD training bounds: {self._ecod_bounds}")
+        print(f"[L1] IForest training bounds: {self._iforest_bounds}")
+        print(f"[L1] SVM training bounds: {self._svm_bounds}")
+        
         print(f"[L1] Ensemble trained. Block threshold = {threshold}")
         return self
 
     def score(self, embeddings: np.ndarray) -> np.ndarray:
         """Returns anomaly scores in [0, 1]. Higher = more anomalous."""
-        scores_ecod    = self._norm(self.ecod.decision_function(embeddings))
-        scores_iforest = self._norm(self.iforest.decision_function(embeddings))
-        scores_svm     = self._norm(-self.svm.decision_function(embeddings))
+        scores_ecod    = self._norm(self.ecod.decision_function(embeddings), self._ecod_bounds)
+        scores_iforest = self._norm(self.iforest.decision_function(embeddings), self._iforest_bounds)
+        scores_svm     = self._norm(-self.svm.decision_function(embeddings), self._svm_bounds)
         return (scores_ecod + scores_iforest + scores_svm) / 3.0
 
     @staticmethod
-    def _norm(arr: np.ndarray) -> np.ndarray:
-        mn, mx = arr.min(), arr.max()
-        if mx == mn:
-            return np.zeros_like(arr, dtype=float)
-        return (arr - mn) / (mx - mn)
+    def _norm(arr: np.ndarray, bounds: Optional[tuple[float, float]] = None) -> np.ndarray:
+        if bounds is None or bounds[0] == bounds[1]:
+            mn, mx = arr.min(), arr.max()
+            if mx == mn:
+                return np.zeros_like(arr, dtype=float)
+            return (arr - mn) / (mx - mn)
+        mn, mx = bounds
+        return np.clip((arr - mn) / (mx - mn), 0.0, 1.0)
 
     def save(self, path: str) -> None:
         import joblib
@@ -203,17 +236,56 @@ class EnsembleDetector:
         joblib.dump(self.iforest,   base + ".iforest.pkl")
         joblib.dump(self.svm,       base + ".svm.pkl")
         joblib.dump(self.threshold, base + ".threshold.pkl")
-        print(f"[L1] Ensemble saved to 4 component files at {path}")
+        
+        bounds = {
+            "ecod": self._ecod_bounds,
+            "iforest": self._iforest_bounds,
+            "svm": self._svm_bounds,
+        }
+        joblib.dump(bounds, base + ".bounds.pkl")
+        print(f"[L1] Ensemble saved to component files (including bounds) at {path}")
 
     @classmethod
     def load(cls, path: str) -> "EnsembleDetector":
+        """Load ensemble from saved component files. Raises RuntimeError on failure."""
         import joblib
         base = str(path)
         obj = cls.__new__(cls)
-        obj.ecod      = joblib.load(base + ".ecod.pkl")
-        obj.iforest   = joblib.load(base + ".iforest.pkl")
-        obj.svm       = joblib.load(base + ".svm.pkl")
-        obj.threshold = joblib.load(base + ".threshold.pkl")
+        component_files = {
+            "ecod":      base + ".ecod.pkl",
+            "iforest":   base + ".iforest.pkl",
+            "svm":       base + ".svm.pkl",
+            "threshold": base + ".threshold.pkl",
+        }
+        for attr, fpath in component_files.items():
+            if not Path(fpath).exists():
+                raise RuntimeError(f"[L1] Model component missing: {fpath}")
+            try:
+                setattr(obj, attr, joblib.load(fpath))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[L1] Failed to load model component '{fpath}': {exc}"
+                ) from exc
+        
+        # Load bounds if present
+        bounds_path = base + ".bounds.pkl"
+        if Path(bounds_path).exists():
+            try:
+                bounds = joblib.load(bounds_path)
+                obj._ecod_bounds = bounds.get("ecod")
+                obj._iforest_bounds = bounds.get("iforest")
+                obj._svm_bounds = bounds.get("svm")
+            except Exception as exc:
+                logger.warning(f"[L1] Failed to load bounds: {exc}. Using dynamic normalization.")
+                obj._ecod_bounds = None
+                obj._iforest_bounds = None
+                obj._svm_bounds = None
+        else:
+            logger.warning("[L1] Bounds file missing. Using dynamic normalization.")
+            obj._ecod_bounds = None
+            obj._iforest_bounds = None
+            obj._svm_bounds = None
+            
         return obj
 
 
@@ -242,20 +314,44 @@ class AnomalyDetector:
         self.detector = detector
 
     def scan(self, chunks: list[str]) -> dict:
+        """Scan document chunks for anomalies. Returns detection results dict."""
+        # Input validation
+        if not chunks:
+            logger.warning("[L1] scan() called with empty chunks list")
+            return {
+                "chunk_scores":   [],
+                "window_scores":  [],
+                "full_score":     0.0,
+                "max_score":      0.0,
+                "flagged_chunks": [],
+                "blocked":        False,
+                "confidence":     0.0,
+                "ev": [("Warning", "No document chunks provided")],
+            }
 
-        # ── Per-chunk scores ─────────────────────────────────────────────────
+        if self.detector.threshold is None:
+            raise RuntimeError("[L1] Detector threshold not set. Re-load the detector.")
+
+        # ── Per-chunk scores ─────────────────────────────────────────────────────────
         chunk_embs   = self.embedder.encode(chunks)
         chunk_scores = self.detector.score(chunk_embs).tolist()
         flagged      = [i for i, s in enumerate(chunk_scores)
                         if s > self.detector.threshold]
 
-        # ── Sliding window ───────────────────────────────────────────────────
-        window_scores = []
-        for i in range(len(chunks) - 1):
-            combined = chunks[i] + " " + chunks[i + 1]
-            emb      = self.embedder.encode([combined])
-            score    = float(self.detector.score(emb)[0])
-            window_scores.append(round(score, 4))
+        # ── Sliding window (BATCHED — one encode call instead of N-1) ────────────────
+        window_scores: list[float] = []
+        if len(chunks) > 1:
+            window_texts = [
+                chunks[i] + " " + chunks[i + 1]
+                for i in range(len(chunks) - 1)
+            ]
+            window_embs  = self.embedder.encode(window_texts)
+            window_scores = [
+                round(float(s), 4)
+                for s in self.detector.score(window_embs)
+            ]
+        else:
+            window_scores = [round(chunk_scores[0], 4)]
 
         # ── Full-document score ───────────────────────────────────────────────
         full_text  = " ".join(chunks)
@@ -267,6 +363,14 @@ class AnomalyDetector:
         )
         blocked = max_score > self.detector.threshold
 
+        # Confidence: distance from threshold, normalised to [0, 1]
+        confidence = round(min(abs(max_score - self.detector.threshold) * 2, 1.0), 4)
+
+        logger.info(
+            "[L1] max_score=%.4f threshold=%.4f blocked=%s flagged=%d/%d",
+            max_score, self.detector.threshold, blocked, len(flagged), len(chunks),
+        )
+
         return {
             "chunk_scores":   [round(s, 4) for s in chunk_scores],
             "window_scores":  window_scores,
@@ -274,11 +378,13 @@ class AnomalyDetector:
             "max_score":      max_score,
             "flagged_chunks": flagged,
             "blocked":        blocked,
+            "confidence":     confidence,
             "ev": [
                 ("Chunks flagged",    f"{len(flagged)} / {len(chunks)}"),
                 ("Max chunk score",   f"{max(chunk_scores):.4f}"),
                 ("Window scan max",   f"{max(window_scores, default=0.0):.4f}"),
                 ("Full doc score",    f"{full_score:.4f}"),
+                ("Confidence",        f"{confidence:.4f}"),
                 ("Detector ensemble", "ECOD · IForest · OneClassSVM"),
             ],
         }
@@ -298,12 +404,18 @@ def load_detector(models_path: str = L1_MODELS_PATH) -> AnomalyDetector:
         The saved pkl threshold value is ignored.
     """
     embedder = InstructorEmbedder()
-    detector = EnsembleDetector.load(models_path)
+    try:
+        detector = EnsembleDetector.load(models_path)
+    except RuntimeError:
+        logger.warning("[L1] Pre-trained models not found. Attempting download ...")
+        load_or_download_models()
+        detector = EnsembleDetector.load(models_path)
 
     # Override saved threshold with current config value.
     # This means changing L1_BLOCK_THRESHOLD in config.py
     # takes effect immediately without retraining.
     detector.threshold = L1_BLOCK_THRESHOLD
+    logger.info("[L1] Threshold set to %.4f (from config.py)", L1_BLOCK_THRESHOLD)
     print(f"[L1] Threshold set to {L1_BLOCK_THRESHOLD} (from config.py)")
 
     return AnomalyDetector(embedder, detector)

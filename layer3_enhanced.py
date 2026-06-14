@@ -18,6 +18,7 @@ Wire into app.py
 
 import re
 import json
+import logging
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,8 @@ from config import (
     L3_MAX_DOC_LEN,
     SENSITIVE_PATTERNS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,7 +324,9 @@ class BoundaryTracker:
 
         exfil_violations = []
         if query:
-            exfil_violations = self.find_exfiltration(query)
+            exfil_violations.extend(self.find_exfiltration(query))
+        if doc_text:
+            exfil_violations.extend(self.find_exfiltration(doc_text))
 
         all_violations = doc_violations + resp_violations + exfil_violations
 
@@ -357,29 +362,36 @@ class ConsistencyClassifier:
         self.model.eval()
 
     def score(self, system_prompt: str, response: str) -> float:
-        enc = self.tokenizer(
-            system_prompt,
-            response,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding=True,
-        ).to(self.device)
+        """Score consistency between system prompt and response. Returns risk in [0,1]."""
+        if not response or not response.strip():
+            return 0.0
+        try:
+            enc = self.tokenizer(
+                system_prompt,
+                response,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True,
+            ).to(self.device)
 
-        with torch.no_grad():
-            out    = self.model(**enc)
-            logits = out.logits[0]
+            with torch.no_grad():
+                out    = self.model(**enc)
+                logits = out.logits[0]
 
-            if logits.shape[0] == 1:
-                # Base ranking model
-                relevance   = float(torch.sigmoid(logits[0]))
-                raw_risk    = 1.0 - relevance
-                scaled_risk = raw_risk ** 0.7  # spread values from center
-                return round(min(max(scaled_risk, 0.0), 1.0), 4)
+                if logits.shape[0] == 1:
+                    # Base ranking model
+                    relevance   = float(torch.sigmoid(logits[0]))
+                    raw_risk    = 1.0 - relevance
+                    scaled_risk = raw_risk ** 0.7  # spread values from center
+                    return round(min(max(scaled_risk, 0.0), 1.0), 4)
 
-            # Fine-tuned binary classifier
-            probs = torch.softmax(logits, dim=-1)
-            return round(float(probs[1]), 4)
+                # Fine-tuned binary classifier
+                probs = torch.softmax(logits, dim=-1)
+                return round(float(probs[1]), 4)
+        except Exception as exc:
+            logger.warning("[L3] ConsistencyClassifier.score() failed: %s", exc)
+            return 0.5  # Conservative fallback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,6 +426,13 @@ class BehavioralMonitor:
               l1:            dict,
               l2:            dict,
               raw_response:  Optional[str] = None) -> dict:
+        """Run all three Layer 3 components and return unified result."""
+        import unicodedata
+        query = unicodedata.normalize('NFKC', query)
+        system_prompt = unicodedata.normalize('NFKC', system_prompt)
+        chunks = [unicodedata.normalize('NFKC', c) for c in chunks]
+        if raw_response is not None:
+            raw_response = unicodedata.normalize('NFKC', raw_response)
 
         full_doc = " ".join(chunks)
 
@@ -429,7 +448,10 @@ class BehavioralMonitor:
 
         # ── Component C: Consistency scoring ──────────────────────────────────
         upstream_risk = (l1["max_score"] + l2["stage1_prob"]) / 2.0
-        cs_score = self.consistency.score(system_prompt, raw_response or query)
+        if raw_response is None:
+            cs_score = 0.0
+        else:
+            cs_score = self.consistency.score(system_prompt, raw_response)
 
         # Boost if upstream layers flagged something
         if upstream_risk > 0.50:
@@ -463,17 +485,28 @@ class BehavioralMonitor:
             else "; ".join(schema_result["issues"])
         )
 
+        # Confidence: how far consistency score is from the threshold
+        confidence = round(min(abs(cs_score - L3_CONSISTENCY_THRESHOLD) * 2, 1.0), 4)
+
+        logger.info(
+            "[L3] cs_score=%.4f upstream_risk=%.4f blocked=%s schema_valid=%s violations=%d",
+            cs_score, upstream_risk, blocked,
+            schema_result["valid"], len(boundary_result["violations"]),
+        )
+
         return {
             "schema_valid":        schema_result["valid"],
             "schema_issues":       schema_result["issues"],
             "boundary_violations": boundary_result["violations"],
             "consistency_score":   cs_score,
             "blocked":             blocked,
+            "confidence":          confidence,
             "ev": [
                 ("Schema validation",   schema_str),
                 ("Boundary violations", str(boundary_result["count"])),
                 ("Consistency risk",    f"{cs_score:.4f}"),
                 ("Upstream risk",       f"{upstream_risk:.4f}"),
+                ("Confidence",          f"{confidence:.4f}"),
                 ("Base model",          "ms-marco-MiniLM-L-12 (enhanced)"),
             ],
         }
@@ -497,12 +530,17 @@ def load_monitor(finetuned_path: str = L3_FINETUNED_PATH) -> BehavioralMonitor:
         print(f"[L3] Loading fine-tuned model from '{finetuned_path}'")
         load_path = finetuned_path
 
-    tok   = AutoTokenizer.from_pretrained(load_path)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        load_path,
-        ignore_mismatched_sizes=True,
-    )
-    print(f"[L3] Consistency classifier ready ({load_path})")
+    try:
+        tok   = AutoTokenizer.from_pretrained(load_path)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            load_path,
+            ignore_mismatched_sizes=True,
+        )
+        print(f"[L3] Consistency classifier ready ({load_path})")
+    except Exception as exc:
+        raise RuntimeError(
+            f"[L3] Failed to load consistency model '{load_path}': {exc}"
+        ) from exc
 
     return BehavioralMonitor(
         schema_validator = SchemaValidator(),
@@ -548,7 +586,7 @@ if __name__ == "__main__":
         print("          Generate training pairs first.")
         exit(1)
 
-    with open(pairs_path) as f:
+    with open(pairs_path, encoding="utf-8") as f:
         pairs = [json.loads(line) for line in f]
 
     texts_a = [p["system_prompt"] for p in pairs]
@@ -612,4 +650,4 @@ if __name__ == "__main__":
 
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
-    print(f"\n[L3] Consistency classifier saved → {out_dir}")
+    print(f"\n[L3] Consistency classifier saved to {out_dir}")

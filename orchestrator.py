@@ -23,9 +23,12 @@ import pickle
 import logging
 import joblib
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from sklearn.linear_model import LogisticRegressionCV
@@ -40,6 +43,10 @@ from config import (
     LOG_PATH,
     MAX_HISTORY_ITEMS,
     ENABLE_L1_EARLY_EXIT,
+    CANARY_TOKEN,
+    CANARY_DETECTION_ENABLED,
+    STATEFUL_HISTORY_LIMIT,
+    STATEFUL_DRIFT_THRESHOLD,
 )
 
 from keyword_detector import keyword_check
@@ -96,12 +103,14 @@ class MetaAggregator:
         self.scaler = scaler
 
     def _features(self, l1: dict, l2: dict, l3: dict) -> np.ndarray:
+        # l2_consistency_score features scale naturally since training query-document pairs are matched.
+        l2_consist_safe = float(l2["consistency_score"])
         return np.array([
             l1["max_score"],
             max(l1["window_scores"], default=0.0),
             l1["full_score"],
             l2["stage1_prob"],
-            l2["consistency_score"],
+            l2_consist_safe,
             0.0 if l3["schema_valid"] else 1.0,
             min(len(l3["boundary_violations"]) / max(META_HARD_BLOCK_VIOLS, 1), 1.0),
             l3["consistency_score"],
@@ -141,10 +150,10 @@ class MetaAggregator:
         if self._fitted:
             prob = float(self.model.predict_proba(features_for_model)[0][1])
         else:
-            # Fallback weighted sum
-            w = np.array([0.08, 0.04, 0.03, 0.60, 0.04,
-                          0.08, 0.06, 0.04, 0.02, 0.01])
-            prob = float(np.clip(float(np.dot(features, w)), 0, 1))
+            raise RuntimeError(
+                "Meta-aggregator model file is missing or not trained. "
+                "Please run training first: python train_meta_aggregator.py"
+            )
 
         kw_found = False
         kw_match = None
@@ -179,7 +188,8 @@ class MetaAggregator:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self.model, path)
 
-        scaler_path = path.replace("meta_aggregator.pkl", "meta_scaler.pkl")
+        # Build scaler path alongside the model file (robust to path changes)
+        scaler_path = str(Path(path).parent / "meta_scaler.pkl")
         if self.scaler is not None:
             joblib.dump(self.scaler, scaler_path)
 
@@ -194,7 +204,7 @@ class MetaAggregator:
         # Preferred path: joblib sklearn model + optional scaler
         try:
             model = joblib.load(path)
-            scaler_path = path.replace("meta_aggregator.pkl", "meta_scaler.pkl")
+            scaler_path = str(Path(path).parent / "meta_scaler.pkl")
             scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
             logger.info(f"MetaAggregator loaded via joblib -> {path}")
             return cls(model=model, scaler=scaler)
@@ -208,9 +218,10 @@ class MetaAggregator:
             logger.info(f"MetaAggregator loaded via pickle -> {path}")
             return obj
         except Exception as e:
-            logger.error(f"Could not load MetaAggregator from {path}: {e}")
-            logger.warning("Falling back to default untrained MetaAggregator.")
-            return cls()
+            raise RuntimeError(
+                f"Could not load MetaAggregator from {path}: {e}. "
+                "Please run: python train_meta_aggregator.py"
+            )
 
 
 
@@ -231,9 +242,14 @@ class PipelineLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, result: dict) -> None:
+        import hashlib
+        # Use stable sha256 hash (Python's built-in hash() is not deterministic
+        # across interpreter restarts since Python 3.3 hash randomisation)
+        query_short = result.get("query_short", "")
+        query_hash = hashlib.sha256(query_short.encode("utf-8")).hexdigest()[:8]
         entry = {
             "timestamp": datetime.utcnow().isoformat(),
-            "query_hash": hash(result.get("query_short", "")),
+            "query_hash": query_hash,
             "action": result["action"],
             "risk_score": result["meta"]["risk_score"],
             "l1_max": result["l1"]["max_score"],
@@ -248,8 +264,11 @@ class PipelineLogger:
             "keyword_boost": result["meta"].get("keyword_boost", 0.0),
             "confirmed_attack": None,
         }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            logger.error("[PipelineLogger] Failed to write log entry: %s", exc)
 
     def load_confirmed(self) -> tuple:
         X, y = [], []
@@ -267,6 +286,86 @@ class PipelineLogger:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+class StatefulAttackTracker:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(StatefulAttackTracker, cls).__new__(cls)
+                cls._instance.history = defaultdict(list)
+                cls._instance.lock = threading.Lock()
+            return cls._instance
+
+    def add_score(self, session_id: str, score: float):
+        if not session_id:
+            return
+        with self.lock:
+            hist = self.history[session_id]
+            hist.append(score)
+            if len(hist) > STATEFUL_HISTORY_LIMIT:
+                hist.pop(0)
+
+    def get_drift_score(self, session_id: str) -> float:
+        if not session_id:
+            return 0.0
+        with self.lock:
+            hist = self.history[session_id]
+            if not hist:
+                return 0.0
+            weights = [0.5 ** i for i in range(len(hist))][::-1]
+            total_weight = sum(weights)
+            weighted_score = sum(h * w for h, w in zip(hist, weights)) / total_weight
+            return round(weighted_score, 4)
+
+    def get_session_history(self, session_id: str) -> list[float]:
+        """Return the raw score history for a session (for UI display)."""
+        if not session_id:
+            return []
+        with self.lock:
+            return list(self.history.get(session_id, []))
+
+    def get_trend(self, session_id: str) -> str:
+        """Return 'rising', 'falling', or 'stable' based on recent score trend."""
+        hist = self.get_session_history(session_id)
+        if len(hist) < 2:
+            return "stable"
+        delta = hist[-1] - hist[-2]
+        if delta > 0.05:
+            return "rising"
+        elif delta < -0.05:
+            return "falling"
+        return "stable"
+
+
+def _make_canary_block_result(source: str, query: str) -> dict:
+    meta = {
+        "risk_score": 1.0,
+        "action": "hard_block",
+        "confidence": 1.0,
+        "hard_block": True,
+        "features": [1.0] * 10,
+        "keyword_boost_applied": False,
+        "keyword_match": f"canary_token_leak:{source}",
+        "keyword_boost": 0.0,
+    }
+    return {
+        "chunks": [],
+        "l1": {"blocked": True, "max_score": 1.0, "window_scores": [], "full_score": 1.0, "flagged_chunks": [], "ev": [("Canary Check", f"Failed: detected in {source}")]},
+        "l2": _make_skipped_l2(),
+        "l3": _make_skipped_l3(),
+        "meta": meta,
+        "blocking_layer": "Canary Honeypot Detector",
+        "blocked": True,
+        "monitored": False,
+        "action": "hard_block",
+        "timestamp": datetime.utcnow().strftime("%H:%M:%S UTC"),
+        "query_short": query[:60] + ("..." if len(query) > 60 else ""),
+        "early_exit": True,
+    }
+
 
 def _make_skipped_l2() -> dict:
     return {
@@ -301,27 +400,87 @@ def run_pipeline(document: str,
                  l2_classifier=None,
                  l3_monitor=None,
                  meta_aggregator=None,
-                 raw_response: Optional[str] = None) -> dict:
+                 raw_response: Optional[str] = None,
+                 session_id: Optional[str] = None,
+                 canary_manager=None) -> dict:
     """
     Full pipeline execution.
+
+    Raises ValueError for empty inputs.
+    Raises RuntimeError if detectors are not provided.
     """
+    import unicodedata
+    def sanitize_text(text: str) -> str:
+        if not text:
+            return ""
+        text = ''.join(c for c in text if unicodedata.category(c)[0] != 'C' or c in '\n\t')
+        return unicodedata.normalize('NFKC', text)
+
+    document = sanitize_text(document)
+    query = sanitize_text(query)
+    system_prompt = sanitize_text(system_prompt)
+    if raw_response is not None:
+        raw_response = sanitize_text(raw_response)
+
     from layer1_anomaly import split_chunks
+
+    # Input validation
+    if not document or not document.strip():
+        raise ValueError("run_pipeline: 'document' must not be empty.")
+    if not query or not query.strip():
+        raise ValueError("run_pipeline: 'query' must not be empty.")
+    if not system_prompt:
+        system_prompt = "Answer using only the provided knowledge base."
+
+    # Active Defense: Canary token checks on user query
+    if CANARY_DETECTION_ENABLED and CANARY_TOKEN and CANARY_TOKEN.lower() in query.lower():
+        logger.warning(f"[Canary] Canary token '{CANARY_TOKEN}' detected in user query.")
+        return _make_canary_block_result("query", query)
+
+    # Active Defense: Canary token checks on raw response (post-response check)
+    if CANARY_DETECTION_ENABLED and CANARY_TOKEN and raw_response and CANARY_TOKEN.lower() in raw_response.lower():
+        logger.warning(f"[Canary] Canary token '{CANARY_TOKEN}' detected in response.")
+        return _make_canary_block_result("response", query)
 
     chunks = split_chunks(document)
 
-    # Layer 1
+    # Active Defense: Canary context check on retrieved document chunks
+    if canary_manager is not None and CANARY_DETECTION_ENABLED:
+        context_leaked, leaked_chunk = canary_manager.check_context(chunks)
+        if context_leaked:
+            logger.warning("[Canary] Canary token detected in document context. Hard-blocking.")
+            result = _make_canary_block_result("document_context", query)
+            result["l1"]["ev"].append(("Canary Context", f"Token found in retrieved document chunk: {(leaked_chunk or '')[:60]}"))
+            return result
+
+    # Layer 1 & 2 Execution in Parallel
     if l1_detector is None:
         raise RuntimeError(
             "l1_detector is None. Load with load_detector() and pass to run_pipeline()."
         )
-    l1 = l1_detector.scan(chunks)
+    if l2_classifier is None:
+        raise RuntimeError(
+            "l2_classifier is None. Load with load_classifier() and pass to run_pipeline()."
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_l1 = executor.submit(l1_detector.scan, chunks)
+        future_l2 = executor.submit(l2_classifier.classify, query, chunks)
+        try:
+            l1 = future_l1.result()
+        except Exception as exc:
+            logger.error("Layer 1 scanning failed: %s", exc)
+            raise RuntimeError(f"Layer 1 scan failure: {exc}") from exc
+        try:
+            l2 = future_l2.result()
+        except Exception as exc:
+            logger.error("Layer 2 classification failed: %s", exc)
+            raise RuntimeError(f"Layer 2 classification failure: {exc}") from exc
 
     # ── Optional early exit after Layer 1 ────────────────────────────────────
     if ENABLE_L1_EARLY_EXIT and l1["blocked"]:
-        l2 = _make_skipped_l2()
         l3 = _make_skipped_l3()
 
-        # For early exit, use Layer 1 max score as conservative risk proxy.
         meta = {
             "risk_score": round(float(l1["max_score"]), 4),
             "action": "blocked",
@@ -348,6 +507,10 @@ def run_pipeline(document: str,
             "early_exit": True,
         }
 
+        # Stateful history update for early exit
+        if session_id:
+            StatefulAttackTracker().add_score(session_id, meta["risk_score"])
+
         try:
             PipelineLogger().log(result)
         except Exception as e:
@@ -355,16 +518,9 @@ def run_pipeline(document: str,
 
         logger.info(
             f"action=blocked  risk={meta['risk_score']:.4f}  "
-            f"l1={l1['max_score']:.4f}  l2=SKIPPED  l3=SKIPPED  early_exit=True"
+            f"l1={l1['max_score']:.4f}  l2={l2['stage1_prob']:.4f}  l3=SKIPPED  early_exit=True"
         )
         return result
-
-    # Layer 2
-    if l2_classifier is None:
-        raise RuntimeError(
-            "l2_classifier is None. Load with load_classifier() and pass to run_pipeline()."
-        )
-    l2 = l2_classifier.classify(query, chunks)
 
     # Layer 3
     if l3_monitor is None:
@@ -374,7 +530,14 @@ def run_pipeline(document: str,
     l3 = l3_monitor.check(query, system_prompt, chunks, l1, l2, raw_response)
 
     # Meta aggregator
-    agg = meta_aggregator or MetaAggregator()
+    if meta_aggregator is None:
+        logger.warning(
+            "[pipeline] meta_aggregator not provided — using untrained fallback weights. "
+            "Run 'python orchestrator.py retrain' after labelling log entries."
+        )
+        agg = MetaAggregator()
+    else:
+        agg = meta_aggregator
     meta = agg.predict(l1, l2, l3, query=query)
 
     # Determine which layer blocked
@@ -406,13 +569,28 @@ def run_pipeline(document: str,
         "early_exit": False,
     }
 
+    # Stateful multi-turn Crescendo protection
+    if session_id:
+        tracker = StatefulAttackTracker()
+        tracker.add_score(session_id, meta["risk_score"])
+        drift = tracker.get_drift_score(session_id)
+        if drift > STATEFUL_DRIFT_THRESHOLD and meta["action"] not in ("blocked", "hard_block"):
+            logger.warning(f"[Stateful] Multi-turn drift score {drift} exceeded threshold {STATEFUL_DRIFT_THRESHOLD}. Escalating to blocked.")
+            meta["action"] = "blocked"
+            meta["risk_score"] = max(meta["risk_score"], drift)
+            result["blocked"] = True
+            result["action"] = "blocked"
+            result["blocking_layer"] = "Stateful Multi-Turn Tracker"
+            result["meta"]["risk_score"] = meta["risk_score"]
+            result["meta"]["action"] = "blocked"
+
     try:
         PipelineLogger().log(result)
     except Exception as e:
         logger.warning(f"Logging failed: {e}")
 
     logger.info(
-        f"action={meta['action']}  risk={meta['risk_score']:.4f}  "
+        f"action={result['action']}  risk={result['meta']['risk_score']:.4f}  "
         f"l1={l1['max_score']:.4f}  l2={l2['stage1_prob']:.4f}  "
         f"l3={l3['consistency_score']:.4f}  early_exit=False"
     )
