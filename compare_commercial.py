@@ -550,8 +550,8 @@ def main():
         )
         action = str(res.get("action", "")).lower()
         rs_blocked = 1 if (
-            res.get("blocked") or res.get("monitored") or
-            action in {"blocked", "block", "hard_block", "monitor", "monitored"}
+            res.get("blocked") or
+            action in {"blocked", "block", "hard_block"}
         ) else 0
         systems["RAG-Shield (Ours)"]["preds"].append(rs_blocked)
         systems["RAG-Shield (Ours)"]["latencies"].append((time.time() - t0) * 1000)

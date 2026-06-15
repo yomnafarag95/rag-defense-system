@@ -299,11 +299,11 @@ def _eval_ragshield_full(samples: List[Dict],
     t0 = time.time()
     for i, s in enumerate(samples, 1):
         text = s["text"]
-        if s["label"] == 1:
-            # Attack: text is the query; use benign doc
-            doc, query = BENIGN_DOC, text
+        if s["label"] == 1 and s.get("source") == "injecagent":
+            # Indirect injection: attack text is the document, query is benign summary request
+            doc, query = text, "Please summarize the retrieved document."
         else:
-            # Benign: text is the query; use benign doc
+            # Direct injection/jailbreak (HackAPrompt) or Benign: text is the query; use benign doc
             doc, query = BENIGN_DOC, text
 
         try:

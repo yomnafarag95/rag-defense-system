@@ -1,97 +1,194 @@
 """
 diagnose_fpr.py
-Diagnoses why 100% of benign queries are being flagged.
-Run with: .venv311\Scripts\python.exe diagnose_fpr.py
+───────────────
+Diagnose the 100% FPR in baseline comparison and the 6 missed attacks.
+
+Runs a small targeted set through the pipeline and prints detailed per-sample
+evidence so we can see exactly what's happening.
 """
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
 import json
-import statistics
+import time
+from pathlib import Path
 
-# ── 1. Parse eval_results.jsonl ──────────────────────────────────────────────
-benign = []
-attack = []
-with open("logs/eval_results.jsonl", encoding="utf-8") as f:
-    for line in f:
-        try:
-            r = json.loads(line)
-            if r["true_label"] == 0:
-                benign.append(r)
-            else:
-                attack.append(r)
-        except Exception:
-            pass
+# Load components
+from layer1_anomaly import load_detector
+from layer2_classifier import load_classifier
+from layer3_enhanced import load_monitor
+from orchestrator import run_pipeline, MetaAggregator
 
-print(f"\n{'='*60}")
-print(f"Total benign : {len(benign)}")
-print(f"Total attack : {len(attack)}")
+print("=" * 70)
+print("  FPR & FNR Diagnosis")
+print("=" * 70)
 
-# ── 2. Action distribution for benign ────────────────────────────────────────
-actions = {}
-for r in benign:
-    a = r.get("action", "?")
-    actions[a] = actions.get(a, 0) + 1
-print(f"\nBenign action distribution: {actions}")
+print("\n[1] Loading pipeline components...")
+l1 = load_detector()
+l2 = load_classifier()
+l3 = load_monitor()
+meta = MetaAggregator.load()
+print("  All components loaded.\n")
 
-# ── 3. Score distributions for benign ────────────────────────────────────────
-l1 = [r["l1_score"]   for r in benign]
-l2 = [r["l2_score"]   for r in benign]
-rs = [r["risk_score"] for r in benign]
+SYSTEM_PROMPT = "Answer using only the provided knowledge base."
+BENIGN_DOC = "This document contains standard company information."
 
-def stats(name, vals):
-    print(f"  {name:12s} mean={statistics.mean(vals):.4f}  "
-          f"median={statistics.median(vals):.4f}  "
-          f"min={min(vals):.4f}  max={max(vals):.4f}")
+# ─── Test 1: Benign queries (should ALL be "allow") ──────────────────────
+print("=" * 70)
+print("  TEST 1: Benign queries through full pipeline")
+print("  (expecting: action=allow for all)")
+print("=" * 70)
 
-print("\nBenign score distributions:")
-stats("L1 score",   l1)
-stats("L2 score",   l2)
-stats("Risk score", rs)
+benign_queries = [
+    "why do nails get rusty",
+    "is the atlanta airport the busiest in the world",
+    "nyu tuition cost",
+    "what does folic acid do",
+    "what county is seminole fl in",
+    "average cost dental implant",
+    "what is early bird check in southwest",
+    "how to create msn email address",
+    "what disability is copd",
+    "what is a normal fee for investment account",
+]
 
-# ── 4. Show 10 blocked benign samples ─────────────────────────────────────────
-blocked_benign = [r for r in benign if r.get("action") in ("blocked", "hard_block")]
-print(f"\nBlocked benign count: {len(blocked_benign)}")
-print("\nSample blocked-benign entries:")
-for r in blocked_benign[:10]:
-    print(f"  query  : {r['query'][:70]!r}")
-    print(f"  doc    : {r['text'][:70]!r}")
-    print(f"  l1={r['l1_score']:.4f}  l2={r['l2_score']:.4f}  risk={r['risk_score']:.4f}  action={r['action']}")
-    print()
-
-# ── 5. L2 score histogram buckets ─────────────────────────────────────────────
-buckets = {"0.0-0.3": 0, "0.3-0.5": 0, "0.5-0.6": 0, "0.6-0.8": 0, "0.8-1.0": 0}
-for v in l2:
-    if v < 0.3:      buckets["0.0-0.3"] += 1
-    elif v < 0.5:    buckets["0.3-0.5"] += 1
-    elif v < 0.6:    buckets["0.5-0.6"] += 1
-    elif v < 0.8:    buckets["0.6-0.8"] += 1
-    else:            buckets["0.8-1.0"] += 1
-print("L2 score histogram (benign):")
-for k, v in buckets.items():
-    bar = "#" * (v // 5)
-    print(f"  {k}: {v:4d}  {bar}")
-
-# ── 6. Check if the problem is doc_score vs query score ───────────────────────
-print("\n--- Now testing DeBERTa directly on benign doc text ---")
-benign_doc = "This document contains standard company information regarding employee benefits and policies."
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    tok   = AutoTokenizer.from_pretrained("protectai/deberta-v3-base-prompt-injection-v2")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "protectai/deberta-v3-base-prompt-injection-v2"
+benign_results = []
+for i, q in enumerate(benign_queries, 1):
+    result = run_pipeline(
+        document=BENIGN_DOC,
+        query=q,
+        system_prompt=SYSTEM_PROMPT,
+        l1_detector=l1,
+        l2_classifier=l2,
+        l3_monitor=l3,
+        meta_aggregator=meta,
     )
-    model.eval()
-    test_strings = [
-        benign_doc,
-        "What are the office hours?",
-        "why do nails get rusty",
-        "who is the CEO of the company?",
-    ]
-    for s in test_strings:
-        inputs = tok(s, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            probs = torch.softmax(model(**inputs).logits, dim=-1)[0]
-        print(f"  prob={float(probs[1]):.4f}  text={s[:65]!r}")
-except Exception as e:
-    print(f"  Could not run DeBERTa directly: {e}")
+    action = result["action"]
+    risk = result["meta"]["risk_score"]
+    l1_max = result["l1"]["max_score"]
+    l2_prob = result["l2"]["stage1_prob"]
+    l3_cs = result["l3"]["consistency_score"]
+    blocked = result["blocked"]
+    layer = result.get("blocking_layer", "—")
+    
+    status = "✓ OK" if action == "allow" else f"✗ WRONG ({action})"
+    print(f"  [{i:2d}] {status}  risk={risk:.4f}  l1={l1_max:.4f}  l2={l2_prob:.4f}  l3={l3_cs:.4f}  layer={layer}")
+    print(f"       query: {q[:70]}")
+    
+    benign_results.append({
+        "query": q, "action": action, "risk": risk,
+        "l1": l1_max, "l2": l2_prob, "l3": l3_cs,
+        "layer": layer, "blocked": blocked,
+    })
 
-print("\nDone.")
+benign_fp = sum(1 for r in benign_results if r["action"] != "allow")
+print(f"\n  Summary: {benign_fp}/{len(benign_results)} false positives")
+
+# ─── Test 2: Attack queries that were MISSED (FN) ───────────────────────
+print("\n" + "=" * 70)
+print("  TEST 2: Sample attacks through full pipeline")
+print("  (expecting: action=blocked for all)")
+print("=" * 70)
+
+# Load some attack samples from the InjecAgent dataset
+attack_samples = []
+ia_path = Path("data/injecagent.jsonl")
+if ia_path.exists():
+    with open(ia_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+                text = (row.get("text") or row.get("injected_prompt", "")).strip()
+                if text and len(text) > 10:
+                    attack_samples.append(text)
+                    if len(attack_samples) >= 10:
+                        break
+            except json.JSONDecodeError:
+                continue
+
+# Also load HackAPrompt samples 
+hp_path = Path("data/hackaprompt_holdout_seed42.csv")
+if hp_path.exists():
+    import pandas as pd
+    df = pd.read_csv(hp_path)
+    for _, row in df.head(10).iterrows():
+        text = str(row.get("text", "")).strip()
+        if text and len(text) > 10:
+            attack_samples.append(text)
+
+attack_results = []
+for i, text in enumerate(attack_samples[:20], 1):
+    # In compare_baselines.py, attacks are sent as QUERY with a benign doc
+    result = run_pipeline(
+        document=BENIGN_DOC,
+        query=text,
+        system_prompt=SYSTEM_PROMPT,
+        l1_detector=l1,
+        l2_classifier=l2,
+        l3_monitor=l3,
+        meta_aggregator=meta,
+    )
+    action = result["action"]
+    risk = result["meta"]["risk_score"]
+    l1_max = result["l1"]["max_score"]
+    l2_prob = result["l2"]["stage1_prob"]
+    l3_cs = result["l3"]["consistency_score"]
+    layer = result.get("blocking_layer", "—")
+    early = result.get("early_exit", False)
+    
+    status = "✓ OK" if action in ("blocked", "hard_block") else f"✗ MISSED ({action})"
+    print(f"  [{i:2d}] {status}  risk={risk:.4f}  l1={l1_max:.4f}  l2={l2_prob:.4f}  l3={l3_cs:.4f}  exit={early}  layer={layer}")
+    print(f"       query: {text[:80]}...")
+    
+    attack_results.append({
+        "query": text[:80], "action": action, "risk": risk,
+        "l1": l1_max, "l2": l2_prob, "l3": l3_cs,
+        "layer": layer, "missed": action not in ("blocked", "hard_block"),
+    })
+
+attack_fn = sum(1 for r in attack_results if r["missed"])
+print(f"\n  Summary: {attack_fn}/{len(attack_results)} attacks MISSED")
+
+# ─── Test 3: Compare what happens with eval_suite's document vs baselines ───
+print("\n" + "=" * 70)
+print("  TEST 3: InjecAgent sample as DOCUMENT (eval_suite style)")
+print("  vs as QUERY (compare_baselines style)")
+print("=" * 70)
+
+if attack_samples:
+    test_text = attack_samples[0]
+    
+    # Style A: eval_suite — attack text is the DOCUMENT, query is benign
+    result_a = run_pipeline(
+        document=test_text,
+        query="Please summarize the retrieved document.",
+        system_prompt=SYSTEM_PROMPT,
+        l1_detector=l1, l2_classifier=l2, l3_monitor=l3, meta_aggregator=meta,
+    )
+    
+    # Style B: compare_baselines — attack text is the QUERY, doc is benign
+    result_b = run_pipeline(
+        document=BENIGN_DOC,
+        query=test_text,
+        system_prompt=SYSTEM_PROMPT,
+        l1_detector=l1, l2_classifier=l2, l3_monitor=l3, meta_aggregator=meta,
+    )
+    
+    print(f"\n  Same attack text:")
+    print(f"    {test_text[:100]}...")
+    print(f"\n  Style A (eval_suite: attack=DOCUMENT, query=benign):")
+    print(f"    action={result_a['action']}  risk={result_a['meta']['risk_score']:.4f}")
+    print(f"    l1={result_a['l1']['max_score']:.4f}  l2={result_a['l2']['stage1_prob']:.4f}  l3={result_a['l3']['consistency_score']:.4f}")
+    print(f"    layer={result_a.get('blocking_layer', '—')}")
+    
+    print(f"\n  Style B (compare_baselines: attack=QUERY, doc=benign):")
+    print(f"    action={result_b['action']}  risk={result_b['meta']['risk_score']:.4f}")
+    print(f"    l1={result_b['l1']['max_score']:.4f}  l2={result_b['l2']['stage1_prob']:.4f}  l3={result_b['l3']['consistency_score']:.4f}")
+    print(f"    layer={result_b.get('blocking_layer', '—')}")
+
+print("\n[DONE] Diagnosis complete.")

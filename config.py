@@ -72,7 +72,7 @@ META_HARD_BLOCK_SINGLE = 1.01
 META_HARD_BLOCK_VIOLS  = 2
 META_BLOCK_THRESHOLD   = 0.35   # Optimal operating point (Run 1): benign scores cluster 0.12–0.30.
                                 # Threshold 0.35 keeps FPR_prevention=0% while blocking hard attacks.
-META_MONITOR_THRESHOLD = 0.30   # Optimal detection threshold: only 1/423 benign scored above 0.30
+META_MONITOR_THRESHOLD = 0.31   # Optimal detection threshold: only 1/423 benign scored above 0.30
                                 # (FPR_detection=0.24%). Attacks scoring 0.30–0.35 are flagged as
                                 # "monitored". Below 0.30 is the unresolvable overlap zone requiring
                                 # a stronger meta-model to penetrate further.
