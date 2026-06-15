@@ -29,6 +29,7 @@ import json
 import time
 import argparse
 import logging
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -85,6 +86,21 @@ def _clean_text(x) -> str:
     if isinstance(x, list):
         x = " ".join(str(v) for v in x)
     return str(x).strip()
+
+
+def _wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion."""
+    if n <= 0:
+        return 0.0, 0.0
+    phat = successes / n
+    denom = 1.0 + (z * z / n)
+    centre = (phat + (z * z) / (2 * n)) / denom
+    margin = (
+        z
+        * math.sqrt((phat * (1.0 - phat) / n) + (z * z / (4 * n * n)))
+        / denom
+    )
+    return max(0.0, centre - margin), min(1.0, centre + margin)
 
 
 # Synthetic tokens injected by code-to-nl dataset construction (CoNaLa/CONCODE).
@@ -265,7 +281,8 @@ class BenchmarkRunner:
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
     def _run_one(self, doc: str, query: str, label: int,
-                 attack_type: Optional[str] = None) -> dict:
+                 attack_type: Optional[str] = None,
+                 source: Optional[str] = None) -> dict:
         doc = _clean_text(doc)
         query = _clean_text(query)
 
@@ -292,6 +309,8 @@ class BenchmarkRunner:
             "l3_score":       float(result.get("l3", {}).get("consistency_score", 0.0)),
             "attack_type":    attack_type,
             "latency_ms":     latency,
+            "timings":        result.get("timings", {}),
+            "source":         source,
             "blocking_layer": result.get("blocking_layer"),
             "early_exit":     bool(result.get("early_exit", False)),
         }
@@ -333,6 +352,23 @@ class BenchmarkRunner:
                 layer_catches[key] = layer_catches.get(key, 0) + 1
 
         early_exit_count = sum(1 for e in entries if e.get("early_exit", False))
+        timings = [e.get("timings") or {} for e in entries]
+        timing_keys = [
+            "chunking_ms", "l1_ms", "l2_ms", "l1_l2_wall_ms",
+            "l3_ms", "meta_ms", "total_ms",
+        ]
+        latency_breakdown = {}
+        for key in timing_keys:
+            vals = [float(t[key]) for t in timings if key in t]
+            if vals:
+                latency_breakdown[key] = {
+                    "mean_ms": round(float(np.mean(vals)), 2),
+                    "p95_ms": round(float(np.percentile(vals, 95)), 2),
+                }
+        cache_stats = {
+            "l1_cache_hits": sum(1 for t in timings if t.get("l1_cache_hit")),
+            "l2_doc_cache_hits": sum(1 for t in timings if t.get("l2_doc_cache_hit")),
+        }
 
         auc_roc_plot = None
         auc_pr_plot = None
@@ -364,6 +400,11 @@ class BenchmarkRunner:
             "mean_latency_ms": round(
                 float(np.mean([e["latency_ms"] for e in entries])), 1
             ),
+            "p95_latency_ms": round(
+                float(np.percentile([e["latency_ms"] for e in entries], 95)), 1
+            ),
+            "latency_breakdown": latency_breakdown,
+            "cache_stats": cache_stats,
             "layer_attribution": layer_catches,
             "early_exit_count": early_exit_count,
         }
@@ -551,6 +592,122 @@ class BenchmarkRunner:
 
         metrics = self._metrics(entries, name="benign")
         self._print_metrics("Benign Baseline (False Positive Rate)", metrics)
+        return metrics
+
+    def _iter_expanded_benign_candidates(self):
+        seen = set()
+
+        def add(text, source):
+            text = _clean_text(text)
+            key = text.lower()
+            if not _valid_eval_text(text) or key in seen:
+                return None
+            seen.add(key)
+            return {"text": text, "source": source}
+
+        csv_sources = [
+            (Path("data/extended_benign.csv"), "query", "extended_benign"),
+        ]
+        for path, field, source in csv_sources:
+            if not path.exists():
+                continue
+            import pandas as pd
+            df = pd.read_csv(path)
+            for _, row in df.iterrows():
+                item = add(row.get(field, ""), source)
+                if item:
+                    yield item
+
+        jsonl_sources = [
+            (Path("data/benign_queries.jsonl"), ("text", "query", "question"), "benign_queries"),
+            (Path("data/wildchat_benign.jsonl"), ("text", "query", "prompt"), "wildchat_benign"),
+            (Path("data/xstest.jsonl"), ("text", "query", "prompt"), "xstest"),
+            (Path("data/technical_docs.jsonl"), ("text", "query", "title"), "technical_docs"),
+            (Path("data/wikipedia_sample.jsonl"), ("text", "query", "title"), "wikipedia_sample"),
+        ]
+        for path, fields, source in jsonl_sources:
+            if not path.exists():
+                continue
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = ""
+                    for field in fields:
+                        if row.get(field):
+                            text = row.get(field)
+                            break
+                    item = add(text, source)
+                    if item:
+                        yield item
+
+    def run_benign_expanded(self, limit: int = 1000) -> dict:
+        print(f"\n[eval] Running expanded benign stress test (limit={limit}) ...")
+        entries = []
+        source_counts = {}
+        benign_doc = (
+            "This document contains standard company information regarding "
+            "employee benefits, policies, support contacts, and product FAQs."
+        )
+
+        for item in self._iter_expanded_benign_candidates():
+            source = item["source"]
+            entries.append(self._run_one(
+                doc=benign_doc,
+                query=item["text"],
+                label=0,
+                source=source,
+            ))
+            source_counts[source] = source_counts.get(source, 0) + 1
+            if len(entries) >= limit:
+                break
+            if len(entries) % 50 == 0:
+                print(f"  [progress] {len(entries)}/{limit} benign samples evaluated")
+
+        metrics = self._metrics(entries, name="benign_expanded")
+        fp_prev = metrics.get("FP_prevention", 0)
+        fp_det = metrics.get("FP_detection", 0)
+        n = metrics.get("n", 0)
+        prev_ci = _wilson_interval(fp_prev, n)
+        det_ci = _wilson_interval(fp_det, n)
+
+        false_positives = [
+            {
+                "query": e["query"],
+                "source": e.get("source"),
+                "action": e["action"],
+                "risk_score": e["risk_score"],
+                "l1_score": e["l1_score"],
+                "l2_score": e["l2_score"],
+                "l3_score": e["l3_score"],
+                "blocking_layer": e.get("blocking_layer"),
+                "latency_ms": e["latency_ms"],
+            }
+            for e in entries
+            if e["pred_detected"] == 1
+        ][:25]
+
+        metrics.update({
+            "source_counts": source_counts,
+            "FPR_prevention_wilson95": [
+                round(prev_ci[0], 4), round(prev_ci[1], 4)
+            ],
+            "FPR_detection_wilson95": [
+                round(det_ci[0], 4), round(det_ci[1], 4)
+            ],
+            "false_positive_examples": false_positives,
+        })
+
+        out = Path("logs/expanded_benign_results.jsonl")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, default=_json_convert) + "\n")
+        print(f"  Expanded benign results saved -> {out}")
+
+        self._print_metrics("Expanded Benign Stress Test", metrics)
         return metrics
 
     # ─────────────────────────────────────────────────────────────────────────

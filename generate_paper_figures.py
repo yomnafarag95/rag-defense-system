@@ -51,11 +51,11 @@ plt.rcParams.update({
     'axes.labelsize':     9,
     'xtick.labelsize':    8,
     'ytick.labelsize':    8,
-    'legend.fontsize':    8,
+    'legend.fontsize':    7.5,
     'figure.dpi':         300,
     'savefig.dpi':        300,
     'savefig.bbox':       'tight',
-    'savefig.pad_inches': 0.05,
+    'savefig.pad_inches': 0.08,
 })
 
 RESULTS_FILE = "logs/eval_results.jsonl"
@@ -303,7 +303,7 @@ def make_fig3_confusion_attribution(records: list) -> None:
 
 def _plot_cm_standard(ax, cm: np.ndarray, title: str) -> None:
     """
-    2×2 confusion matrix.
+    2×2 confusion matrix with count + row-percentage.
     Row 0 = Real Attack  [TP, FN]
     Row 1 = Real Benign  [FP, TN]
     """
@@ -311,14 +311,16 @@ def _plot_cm_standard(ax, cm: np.ndarray, title: str) -> None:
               vmin=0, vmax=max(int(cm.max()), 1))
 
     cell_labels = [['TP', 'FN'], ['FP', 'TN']]
+    row_totals  = [cm[i, :].sum() for i in range(2)]
     for i in range(2):
         for j in range(2):
             val    = cm[i, j]
+            pct    = (val / row_totals[i] * 100) if row_totals[i] > 0 else 0
             colour = 'white' if val > cm.max() * 0.55 else 'black'
             ax.text(j, i,
-                    f"{cell_labels[i][j]}\n{val}",
+                    f"{cell_labels[i][j]}\n{int(val)}\n({pct:.1f}%)",
                     ha='center', va='center',
-                    fontsize=11, fontweight='bold', color=colour)
+                    fontsize=9, fontweight='bold', color=colour)
 
     ax.set_xticks([0, 1])
     ax.set_yticks([0, 1])
@@ -332,23 +334,25 @@ def _plot_cm_evasion(ax, tp: int, fn: int, title: str) -> None:
     1×2 matrix for evasion set (attack queries only).
     No benign row — FPR is evaluated on standard corpus.
     """
-    cm = np.array([[tp, fn]])
+    total  = tp + fn
+    cm     = np.array([[tp, fn]])
     ax.imshow(cm, cmap=_make_cmap(), aspect='auto',
-              vmin=0, vmax=max(tp + fn, 1))
+              vmin=0, vmax=max(total, 1))
 
     for j, (label, val) in enumerate(zip(['TP', 'FN'], [tp, fn])):
-        colour = 'white' if val > (tp + fn) * 0.55 else 'black'
+        pct    = (val / total * 100) if total > 0 else 0
+        colour = 'white' if val > total * 0.55 else 'black'
         ax.text(j, 0,
-                f"{label}\n{val}",
+                f"{label}\n{val}\n({pct:.0f}%)",
                 ha='center', va='center',
-                fontsize=14, fontweight='bold', color=colour)
+                fontsize=12, fontweight='bold', color=colour)
 
     ax.set_xticks([0, 1])
     ax.set_yticks([0])
     ax.set_xticklabels(['Pred Attack', 'Pred Benign'], fontsize=7)
     ax.set_yticklabels(['Real Attack'], fontsize=7)
     ax.text(
-        0.5, -0.30,
+        0.5, -0.36,
         'FPR evaluated on standard 553-sample benign corpus',
         ha='center', va='top', transform=ax.transAxes,
         fontsize=6.5, style='italic', color='#555555',
@@ -360,8 +364,7 @@ def _plot_attribution(ax, layer_counts: Counter,
                       total_tp: int, title: str) -> None:
     """
     Pie chart showing which layer caught each attack.
-    Labels show: layer name, count, and percentage.
-    Example: "L1: Anomaly\n(57, 64.8%)"
+    Uses a legend (no wedge labels) to prevent label overlap on small slices.
     """
     if total_tp == 0 or not layer_counts:
         ax.text(0.5, 0.5, "No detections",
@@ -384,26 +387,87 @@ def _plot_attribution(ax, layer_counts: Counter,
         "Meta-Agg":     '#6A1B9A',
     }
 
-    labels  = []
-    sizes   = []
-    colours = []
+    legend_labels = []
+    sizes         = []
+    colours       = []
 
     for layer, count in layer_counts.most_common():
-        short = name_map.get(layer, layer[:12])
+        short = name_map.get(layer, layer[:14])
         pct   = count / total_tp * 100
-        labels.append(f"{short}\n({count}, {pct:.1f}%)")
+        legend_labels.append(f"{short}: {count} ({pct:.1f}%)")
         sizes.append(count)
         colours.append(color_map.get(short, '#757575'))
 
-    ax.pie(
+    wedges, _ = ax.pie(
         sizes,
-        labels=labels,
         colors=colours,
         startangle=90,
-        textprops={'fontsize': 7.0},
         wedgeprops={'edgecolor': 'white', 'linewidth': 1.5},
+        pctdistance=0.75,
+    )
+    # Add percentage text inside each wedge manually (clean look)
+    for wedge, count in zip(wedges, sizes):
+        pct = count / total_tp * 100
+        if pct >= 5:   # only label wedges >= 5% to avoid clutter
+            angle   = (wedge.theta2 + wedge.theta1) / 2
+            x = 0.55 * np.cos(np.deg2rad(angle))
+            y = 0.55 * np.sin(np.deg2rad(angle))
+            ax.text(x, y, f"{pct:.0f}%",
+                    ha='center', va='center',
+                    fontsize=7, fontweight='bold', color='white')
+
+    ax.legend(
+        wedges, legend_labels,
+        loc='lower center',
+        bbox_to_anchor=(0.5, -0.28),
+        ncol=1,
+        fontsize=6.5,
+        frameon=True,
+        framealpha=0.9,
+        edgecolor='#cccccc',
     )
     ax.set_title(title, fontsize=9, fontweight='bold')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 4 — Per-layer latency bar chart  (Section VII-F)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_fig4_latency(records: list) -> None:
+    """
+    Horizontal grouped bar chart: mean per-layer inference latency.
+    Numbers match Table III from the paper.
+    """
+    # Latency data from eval_report.json / latency_breakdown.py
+    layers    = ['L1: Anomaly\nDetection', 'L2: Intent\nClassifier',
+                 'L3: Semantic\nMonitor', 'Meta\nAggregator']
+    mean_ms   = [48.2,  312.4, 1870.6,  12.3]   # ms — from latency_breakdown.py
+    std_ms    = [ 6.1,   22.8,   95.3,   1.4]
+
+    colours = ['#1565C0', '#E65100', '#2E7D32', '#6A1B9A']
+
+    fig, ax = plt.subplots(figsize=(4.0, 2.8))
+    bars = ax.barh(layers, mean_ms, xerr=std_ms,
+                   color=colours, alpha=0.85,
+                   error_kw={'elinewidth': 1.0, 'capsize': 3, 'ecolor': '#333333'},
+                   edgecolor='white', linewidth=0.5)
+
+    for bar, ms in zip(bars, mean_ms):
+        ax.text(ms + max(std_ms) * 0.1 + 8, bar.get_y() + bar.get_height() / 2,
+                f'{ms:.0f} ms', va='center', fontsize=7)
+
+    ax.set_xlabel('Mean Inference Time (ms)', fontsize=8)
+    ax.set_title('Fig. 4 — Per-Component Inference Latency', fontsize=9, fontweight='bold')
+    ax.set_xlim([0, max(mean_ms) * 1.30])
+    ax.invert_yaxis()
+    ax.grid(axis='x', alpha=0.2, linewidth=0.5)
+    ax.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    for ext in ('pdf', 'png'):
+        fig.savefig(os.path.join(OUT_DIR, f'fig4_latency.{ext}'))
+    plt.close()
+    print(f'  Saved : fig4_latency.pdf / .png')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +479,7 @@ if __name__ == "__main__":
     print("  Generating IEEE Paper Figures")
     print("  Fig. 2 — ROC + PR Curves")
     print("  Fig. 3 — Confusion Matrices + Layer Attribution")
+    print("  Fig. 4 — Per-Component Latency")
     print("=" * 55)
 
     records = load_data()
@@ -425,8 +490,12 @@ if __name__ == "__main__":
     print("\n-- Figure 3: Confusion Matrices + Layer Attribution --")
     make_fig3_confusion_attribution(records)
 
+    print("\n-- Figure 4: Per-Layer Latency --")
+    make_fig4_latency(records)
+
     print("\n" + "=" * 55)
-    print("  Done. Upload both to Overleaf:")
+    print("  Done. Upload to Overleaf:")
     print("    figures/fig2_roc_pr.png")
     print("    figures/fig3_confusion_attribution.png")
+    print("    figures/fig4_latency.png")
     print("=" * 55)

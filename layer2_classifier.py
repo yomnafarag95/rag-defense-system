@@ -35,8 +35,12 @@ import re
 import os
 import logging
 import torch
+import copy
+import hashlib
+import threading
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import pipeline as hf_pipeline
+from typing import Optional, Tuple
 
 from config import (
     L2_STAGE1_THRESHOLD,
@@ -50,6 +54,24 @@ from config import (
 from obfuscation_decoder import ObfuscationDecoder
 
 logger = logging.getLogger(__name__)
+
+_DOC_SCAN_CACHE_LOCK = threading.Lock()
+_DOC_SCAN_CACHE: dict[str, tuple[float, str]] = {}
+_MAX_DOC_SCAN_CACHE_ITEMS = 1024
+
+
+def _stable_chunks_key(chunks: list[str]) -> str:
+    h = hashlib.sha256()
+    for chunk in chunks:
+        h.update(chunk.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _cache_put(cache: dict, key: str, value, max_items: int) -> None:
+    if len(cache) >= max_items:
+        cache.pop(next(iter(cache)))
+    cache[key] = copy.deepcopy(value)
 
 # Default pretrained hub model (fallback when fine-tuned model is absent)
 INJECTION_MODEL    = "protectai/deberta-v3-base-prompt-injection-v2"
@@ -357,7 +379,7 @@ class IntentClassifier:
                 max_score = max(max_score, score)
         return max_score
 
-    def _scan_document_chunks(self, chunks: list[str]) -> tuple[float, str]:
+    def _scan_document_chunks(self, chunks: list[str]) -> tuple[float, str, bool]:
         """
         Scan retrieved document chunks for embedded injection commands.
 
@@ -368,13 +390,20 @@ class IntentClassifier:
         This method detects those commands using targeted patterns
         and DeBERTa unconditionally on all scanned chunks.
 
-        Returns (max_score, source_tag).
+        Returns (max_score, source_tag, cache_hit).
         """
         if not chunks:
-            return 0.0, "no_chunks"
+            return 0.0, "no_chunks", False
 
         max_score = 0.0
         scan_chunks = chunks if L2_DOC_SCAN_CHUNKS is None else chunks[:L2_DOC_SCAN_CHUNKS]
+        cache_key = _stable_chunks_key(scan_chunks)
+
+        with _DOC_SCAN_CACHE_LOCK:
+            cached = _DOC_SCAN_CACHE.get(cache_key)
+            if cached is not None:
+                score, source = cached
+                return score, source, True
 
         for chunk in scan_chunks:
             deberta_score = self._deberta_prob(chunk)
@@ -382,7 +411,10 @@ class IntentClassifier:
             chunk_score = max(pattern_score, deberta_score)
             max_score = max(max_score, chunk_score)
 
-        return round(max_score, 4), "doc_scan"
+        result = (round(max_score, 4), "doc_scan")
+        with _DOC_SCAN_CACHE_LOCK:
+            _cache_put(_DOC_SCAN_CACHE, cache_key, result, _MAX_DOC_SCAN_CACHE_ITEMS)
+        return result[0], result[1], False
 
     def _stage2_label(self, query: str) -> tuple[str, float, str | None]:
         """Coarse heuristic attack-family attribution."""
@@ -398,7 +430,7 @@ class IntentClassifier:
         ov = [len(qw & set(c.lower().split())) / max(len(qw), 1) for c in chunks]
         return round(1.0 - max(ov, default=0.0), 4)
 
-    def classify(self, query: str, chunks: list[str]) -> dict:
+    def classify(self, query: str, chunks: list[str], precomputed_doc_scan: Optional[Tuple[float, str, bool]] = None) -> dict:
         """Classify query and document chunks for injection attacks."""
         import unicodedata
         query = unicodedata.normalize('NFKC', query)
@@ -454,7 +486,10 @@ class IntentClassifier:
             obfuscation_detected = True
             decode_method = decode_method + "+chunk" if decode_method != "none" else "chunk"
 
-        doc_score, doc_source = self._scan_document_chunks(decoded_chunks)
+        if precomputed_doc_scan is not None:
+            doc_score, doc_source, doc_cache_hit = precomputed_doc_scan
+        else:
+            doc_score, doc_source, doc_cache_hit = self._scan_document_chunks(decoded_chunks)
 
         # Use higher of query score and document scan score
         if doc_score > stage1_prob:
@@ -494,6 +529,9 @@ class IntentClassifier:
             "confidence":           confidence,
             "obfuscation_detected": obfuscation_detected,
             "decode_method":        decode_method,
+            "doc_cache_hit":        doc_cache_hit,
+            "doc_score":            doc_score,
+            "doc_source":           doc_source,
             "ev": [
                 ("Attack probability",    f"{final_prob:.4f}  (Stage 1, {final_source})"),
                 ("Query score",           f"{stage1_prob:.4f}  (DeBERTa on decoded query)"),
@@ -504,6 +542,7 @@ class IntentClassifier:
                 ("Query-doc overlap",     f"{consistency:.4f}"),
                 ("Detection source",      final_source),
                 ("Confidence",            f"{confidence:.4f}"),
+                ("Document cache hit",    str(doc_cache_hit)),
                 ("Obfuscation detected",  str(obfuscation_detected) + (f" ({decode_method})" if obfuscation_detected else "")),
                 ("Base model",            getattr(self, '_model_tag', 'deberta-v3 + xlm-roberta (multilingual fallback)')),
             ],

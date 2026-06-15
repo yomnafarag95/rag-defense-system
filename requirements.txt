@@ -30,6 +30,9 @@ pyarrow==15.0.2
 # HuggingFace
 huggingface-hub==0.21.0
 
+# Commercial comparison (compare_commercial.py)
+openai>=1.0.0
+
 # Utilities
 requests==2.32.3
 tqdm==4.66.2

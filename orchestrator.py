@@ -24,6 +24,9 @@ import logging
 import joblib
 import os
 import threading
+import time
+import copy
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -43,6 +46,8 @@ from config import (
     LOG_PATH,
     MAX_HISTORY_ITEMS,
     ENABLE_L1_EARLY_EXIT,
+    ENABLE_L2_EARLY_EXIT,
+    SEMANTIC_CACHE_THRESHOLD,
     CANARY_TOKEN,
     CANARY_DETECTION_ENABLED,
     STATEFUL_HISTORY_LIMIT,
@@ -62,6 +67,63 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_CACHE_LOCK = threading.Lock()
+_L1_SCAN_CACHE: dict[str, dict] = {}
+_MAX_L1_CACHE_ITEMS = 512
+
+
+def _stable_text_key(parts: list[str]) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _remember_lru(cache: dict, key: str, value: dict, max_items: int) -> None:
+    if len(cache) >= max_items:
+        cache.pop(next(iter(cache)))
+    cache[key] = copy.deepcopy(value)
+
+
+def _cached_l1_scan(l1_detector, chunks: list[str]) -> tuple[dict, bool]:
+    key = _stable_text_key(chunks)
+    with _CACHE_LOCK:
+        cached = _L1_SCAN_CACHE.get(key)
+        if cached is not None:
+            return copy.deepcopy(cached), True
+
+    result = l1_detector.scan(chunks)
+    with _CACHE_LOCK:
+        _remember_lru(_L1_SCAN_CACHE, key, result, _MAX_L1_CACHE_ITEMS)
+    return copy.deepcopy(result), False
+
+
+_SEMANTIC_CACHE_LOCK = threading.Lock()
+_SEMANTIC_DOC_CACHE: list[dict] = []  # entries of {"embedding": np.ndarray, "l1": dict, "l2_doc_scan": tuple}
+_MAX_SEMANTIC_CACHE_SIZE = 128
+
+
+def _cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    dot = np.dot(v1, v2)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(dot / (norm1 * norm2))
+
+
+def _semantic_cache_put(embedding: np.ndarray, l1: dict, l2_doc_scan: tuple) -> None:
+    with _SEMANTIC_CACHE_LOCK:
+        if len(_SEMANTIC_DOC_CACHE) >= _MAX_SEMANTIC_CACHE_SIZE:
+            _SEMANTIC_DOC_CACHE.pop(0)
+        _SEMANTIC_DOC_CACHE.append({
+            "embedding": embedding,
+            "l1": copy.deepcopy(l1),
+            "l2_doc_scan": l2_doc_scan
+        })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,6 +471,18 @@ def run_pipeline(document: str,
     Raises ValueError for empty inputs.
     Raises RuntimeError if detectors are not provided.
     """
+    t_pipeline_start = time.perf_counter()
+    timings = {
+        "chunking_ms": 0.0,
+        "l1_ms": 0.0,
+        "l2_ms": 0.0,
+        "l1_l2_wall_ms": 0.0,
+        "l3_ms": 0.0,
+        "meta_ms": 0.0,
+        "total_ms": 0.0,
+        "l1_cache_hit": False,
+        "l2_doc_cache_hit": False,
+    }
     import unicodedata
     def sanitize_text(text: str) -> str:
         if not text:
@@ -442,7 +516,9 @@ def run_pipeline(document: str,
         logger.warning(f"[Canary] Canary token '{CANARY_TOKEN}' detected in response.")
         return _make_canary_block_result("response", query)
 
+    t0 = time.perf_counter()
     chunks = split_chunks(document)
+    timings["chunking_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
     # Active Defense: Canary context check on retrieved document chunks
     if canary_manager is not None and CANARY_DETECTION_ENABLED:
@@ -452,6 +528,31 @@ def run_pipeline(document: str,
             result = _make_canary_block_result("document_context", query)
             result["l1"]["ev"].append(("Canary Context", f"Token found in retrieved document chunk: {(leaked_chunk or '')[:60]}"))
             return result
+
+    # Check Semantic Similarity Cache for Document-level scan results
+    cached_l1 = None
+    cached_l2_doc_scan = None
+    semantic_cache_hit = False
+    doc_emb = None
+
+    if l1_detector is not None:
+        full_text = " ".join(chunks)
+        # Compute embedding of the concatenated document
+        doc_emb = l1_detector.embedder.encode([full_text])[0]
+        
+        with _SEMANTIC_CACHE_LOCK:
+            best_sim = -1.0
+            best_match = None
+            for entry in _SEMANTIC_DOC_CACHE:
+                sim = _cosine_similarity(doc_emb, entry["embedding"])
+                if sim > best_sim:
+                    best_sim = sim
+                    best_match = entry
+            
+            if best_sim >= SEMANTIC_CACHE_THRESHOLD and best_match is not None:
+                cached_l1 = copy.deepcopy(best_match["l1"])
+                cached_l2_doc_scan = best_match["l2_doc_scan"]
+                semantic_cache_hit = True
 
     # Layer 1 & 2 Execution in Parallel
     if l1_detector is None:
@@ -463,19 +564,46 @@ def run_pipeline(document: str,
             "l2_classifier is None. Load with load_classifier() and pass to run_pipeline()."
         )
 
+    def _run_l1():
+        if semantic_cache_hit and cached_l1 is not None:
+            return cached_l1, True, 0.0
+        t = time.perf_counter()
+        res, cache_hit = _cached_l1_scan(l1_detector, chunks)
+        return res, cache_hit, (time.perf_counter() - t) * 1000
+
+    def _run_l2():
+        t = time.perf_counter()
+        res = l2_classifier.classify(query, chunks, precomputed_doc_scan=cached_l2_doc_scan)
+        return res, (time.perf_counter() - t) * 1000
+
+    t_parallel = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_l1 = executor.submit(l1_detector.scan, chunks)
-        future_l2 = executor.submit(l2_classifier.classify, query, chunks)
+        future_l1 = executor.submit(_run_l1)
+        future_l2 = executor.submit(_run_l2)
         try:
-            l1 = future_l1.result()
+            l1, l1_cache_hit, l1_ms = future_l1.result()
+            timings["l1_ms"] = round(l1_ms, 2)
+            timings["l1_cache_hit"] = bool(l1_cache_hit)
+            if semantic_cache_hit:
+                timings["l1_cache_hit"] = True
         except Exception as exc:
             logger.error("Layer 1 scanning failed: %s", exc)
             raise RuntimeError(f"Layer 1 scan failure: {exc}") from exc
         try:
-            l2 = future_l2.result()
+            l2, l2_ms = future_l2.result()
+            timings["l2_ms"] = round(l2_ms, 2)
+            timings["l2_doc_cache_hit"] = bool(l2.get("doc_cache_hit", False))
+            if semantic_cache_hit:
+                timings["l2_doc_cache_hit"] = True
         except Exception as exc:
             logger.error("Layer 2 classification failed: %s", exc)
             raise RuntimeError(f"Layer 2 classification failure: {exc}") from exc
+    timings["l1_l2_wall_ms"] = round((time.perf_counter() - t_parallel) * 1000, 2)
+
+    # Save to semantic cache if it was a cache miss
+    if not semantic_cache_hit and doc_emb is not None:
+        l2_doc_scan_tuple = (l2["doc_score"], l2["doc_source"], l2["doc_cache_hit"])
+        _semantic_cache_put(doc_emb, l1, l2_doc_scan_tuple)
 
     # ── Optional early exit after Layer 1 ────────────────────────────────────
     if ENABLE_L1_EARLY_EXIT and l1["blocked"]:
@@ -505,6 +633,59 @@ def run_pipeline(document: str,
             "timestamp": datetime.utcnow().strftime("%H:%M:%S UTC"),
             "query_short": query[:60] + ("..." if len(query) > 60 else ""),
             "early_exit": True,
+            "timings": {
+                **timings,
+                "total_ms": round((time.perf_counter() - t_pipeline_start) * 1000, 2),
+            },
+        }
+
+        # Stateful history update for early exit
+        if session_id:
+            StatefulAttackTracker().add_score(session_id, meta["risk_score"])
+
+        try:
+            PipelineLogger().log(result)
+        except Exception as e:
+            logger.warning(f"Logging failed: {e}")
+
+        logger.info(
+            f"action=blocked  risk={meta['risk_score']:.4f}  "
+            f"l1={l1['max_score']:.4f}  l2={l2['stage1_prob']:.4f}  l3=SKIPPED  early_exit=True"
+        )
+        return result
+
+    # ── Optional early exit after Layer 2 ────────────────────────────────────
+    if ENABLE_L2_EARLY_EXIT and l2["blocked"]:
+        l3 = _make_skipped_l3()
+
+        meta = {
+            "risk_score": round(float(l2["stage1_prob"]), 4),
+            "action": "blocked",
+            "confidence": round(abs(float(l2["stage1_prob"]) - 0.5) * 2, 4),
+            "hard_block": False,
+            "features": None,
+            "keyword_boost_applied": False,
+            "keyword_match": None,
+            "keyword_boost": 0.0,
+        }
+
+        result = {
+            "chunks": chunks,
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+            "meta": meta,
+            "blocking_layer": "Layer 2 - Intent Classifier",
+            "blocked": True,
+            "monitored": False,
+            "action": "blocked",
+            "timestamp": datetime.utcnow().strftime("%H:%M:%S UTC"),
+            "query_short": query[:60] + ("..." if len(query) > 60 else ""),
+            "early_exit": True,
+            "timings": {
+                **timings,
+                "total_ms": round((time.perf_counter() - t_pipeline_start) * 1000, 2),
+            },
         }
 
         # Stateful history update for early exit
@@ -527,7 +708,9 @@ def run_pipeline(document: str,
         raise RuntimeError(
             "l3_monitor is None. Load with load_monitor() and pass to run_pipeline()."
         )
+    t0 = time.perf_counter()
     l3 = l3_monitor.check(query, system_prompt, chunks, l1, l2, raw_response)
+    timings["l3_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
     # Meta aggregator
     if meta_aggregator is None:
@@ -538,7 +721,9 @@ def run_pipeline(document: str,
         agg = MetaAggregator()
     else:
         agg = meta_aggregator
+    t0 = time.perf_counter()
     meta = agg.predict(l1, l2, l3, query=query)
+    timings["meta_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
     # Determine which layer blocked
     blocking_layer = None
@@ -567,6 +752,7 @@ def run_pipeline(document: str,
         "timestamp": datetime.utcnow().strftime("%H:%M:%S UTC"),
         "query_short": query[:60] + ("..." if len(query) > 60 else ""),
         "early_exit": False,
+        "timings": timings,
     }
 
     # Stateful multi-turn Crescendo protection
@@ -585,6 +771,9 @@ def run_pipeline(document: str,
             result["meta"]["action"] = "blocked"
 
     try:
+        result["timings"]["total_ms"] = round(
+            (time.perf_counter() - t_pipeline_start) * 1000, 2
+        )
         PipelineLogger().log(result)
     except Exception as e:
         logger.warning(f"Logging failed: {e}")
@@ -592,7 +781,8 @@ def run_pipeline(document: str,
     logger.info(
         f"action={result['action']}  risk={result['meta']['risk_score']:.4f}  "
         f"l1={l1['max_score']:.4f}  l2={l2['stage1_prob']:.4f}  "
-        f"l3={l3['consistency_score']:.4f}  early_exit=False"
+        f"l3={l3['consistency_score']:.4f}  early_exit=False  "
+        f"total_ms={result['timings']['total_ms']:.2f}"
     )
 
     return result

@@ -32,6 +32,8 @@ L2_STAGE1_THRESHOLD        = 0.60    # Query-level block threshold
 L2_DOC_SCAN_CHUNKS         = None    # Max document chunks to scan (None means scan all)
 L2_DOC_PATTERN_THRESHOLD   = 0.60    # Document pattern score to trigger block
 L2_NUM_ATTACK_TYPES        = 6
+ENABLE_L2_EARLY_EXIT       = True
+SEMANTIC_CACHE_THRESHOLD   = 0.98
 
 ATTACK_LABELS = {
     0: "instruction_override",

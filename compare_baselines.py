@@ -38,8 +38,17 @@ Notes
 import argparse
 import json
 import time
+import sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+
+# ── Fix Windows cp1252 UnicodeEncodeError ─────────────────────────────────────
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass  # Python < 3.7 fallback
 
 import numpy as np
 from sklearn.metrics import (
@@ -74,11 +83,12 @@ def _load_attack_samples(n: Optional[int] = None) -> List[Dict]:
     if hp_path.exists():
         import pandas as pd
         df = pd.read_csv(hp_path)
-        limit = (n // 2) if n else len(df)
-        for _, row in df.head(limit).iterrows():
-            text = _clean_text(str(row.get("text", "")))
-            if _valid_eval_text(text):
-                samples.append({"text": text, "label": 1, "source": "hackaprompt"})
+        needed = (n - len(samples)) if n is not None else len(df)
+        if needed > 0:
+            for _, row in df.head(needed).iterrows():
+                text = _clean_text(str(row.get("text", "")))
+                if _valid_eval_text(text):
+                    samples.append({"text": text, "label": 1, "source": "hackaprompt"})
 
     if n:
         samples = samples[:n]
@@ -368,6 +378,10 @@ def main():
         description="Head-to-head baseline comparison for RAG-Shield."
     )
     parser.add_argument(
+        "--n-samples", type=int, default=1000,
+        help="Limit total number of samples (default: 1000).",
+    )
+    parser.add_argument(
         "--n-attacks", type=int, default=None,
         help="Limit number of attack samples (default: all).",
     )
@@ -395,8 +409,10 @@ def main():
 
     # ── Load data ──────────────────────────────────────────────────────────────
     print("\n[Data] Loading evaluation splits ...")
-    attack_samples = _load_attack_samples(args.n_attacks)
-    benign_samples = _load_benign_samples(args.n_benign)
+    n_atk = args.n_attacks if args.n_attacks is not None else (args.n_samples // 2)
+    n_ben = args.n_benign if args.n_benign is not None else (args.n_samples - (args.n_samples // 2))
+    attack_samples = _load_attack_samples(n_atk)
+    benign_samples = _load_benign_samples(n_ben)
     all_samples    = attack_samples + benign_samples
     y_true = [s["label"] for s in all_samples]
 
@@ -511,7 +527,7 @@ def main():
     out_path.parent.mkdir(exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    print(f"  Results saved → {out_path}")
+    print(f"  Results saved -> {out_path}")
 
     # ── Paper-ready text ───────────────────────────────────────────────────────
     print("\n  Paper Table (copy-paste):")

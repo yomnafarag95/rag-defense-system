@@ -19,6 +19,7 @@ ENV/
 # ── Environment / secrets ────────────────────────────────────────────────────
 .env
 .env.*
+!.env.example
 secrets.json
 
 # ── Large data files (not committed – use DVC or direct download) ────────────
